@@ -20,9 +20,9 @@ enhancing performance and user experience.
 
 ### Prerequisites
 
-- **Node.js**: Ensure you have [Node.js](https://nodejs.org/) (version X.X.X or
-  higher) installed on your machine.
-- **npm**: Node package manager comes with Node.js.
+- **C Compiler**: Ensure you have a C compiler like `gcc` installed on your
+  machine.
+- **Make**: Make sure you have `make` installed for building the project.
 
 ### Installation
 
