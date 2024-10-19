@@ -33,7 +33,6 @@ enhancing performance and user experience.
    cd CALOD
    ```
 
-````
 2. **Build CALOD:**
 
    ```bash
