@@ -33,7 +33,6 @@ enhancing performance and user experience.
    cd CALOD
    ```
 
-````
 2. **Build CALOD:**
 
    ```bash
@@ -127,4 +126,3 @@ Distributed under the MIT License. See `LICENSE` for more information.
 ---
 
 **CALOD**: Because You Can Never Have Too Much Data!
-````
