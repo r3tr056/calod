@@ -1,21 +1,26 @@
 
 use once_cell::sync::Lazy;
 use std::sync::RwLock;
-use chrono::{Duration, Utc};
-use std::collections::{VecDeque};
+use chrono::{Duration, Utc, Instant};
+use std::collections::{VecDeque, BinaryHeap};
 use dashmap::DashMap;
 use std::sync::Once;
+use std::sync::{Arc, Once, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
-
 
 use serial_test::serial;
 
 use crate::store::calod_data::{CacheEntry, DateTimeMeta, DateTimeMetaBuilder};
-use crate::store::calod_ops::SetOptionalArgs;
 
 static STORE: Lazy<RwLock<Option<CalodStore>>> = Lazy::new(|| RwLock::new(None));
 static INIT: Once = Once::new();
-static mut INIT_COUNT: u8 = 0;
+
+
+#[derive(Debug)]
+pub struct SetOptionalArgs {
+	pub ttl: Duration
+}
 
 #[derive(Debug, Error)]
 pub enum CacheError {
@@ -35,71 +40,73 @@ pub enum CacheError {
 
 #[derive(Debug)]
 pub struct CalodStore {
+	start_time: Instant,
+	request_count: u64,
 	data: DashMap<String, CacheEntry>,
-	lru_queue: VecDeque<String>,
-	capacity: usize,
+	lru_queue: Arc<Mutex<VecDeque<String>>>,
+	capacity: AtomicUsize,
 }
 
-struct CacheEntryWithScore {
-	key: String,
-	score: f64,
-}
 
 pub trait Store {
-	fn initialize();
+	fn initialize(capacity: usize);
 
 	fn get_store() -> &'static mut CalodStore;
 
 	fn get(&self, key: &str) -> Option<&str>;
 
-	// Returns None if key is not present previously, or the old value of the key
 	fn set(&mut self, key: &str, opt: &Option<SetOptionalArgs>) -> Option<DataType>;
 
 	fn is_key_expired(&self, key: &str) -> bool;
 
-	// Return number of key that are deleted
 	fn delete(&mut self, keys: Vec<&str>) -> u64;
 
 	fn invalidate(&self);
 }
 
 impl Store for CalodStore {
-	#[cfg(not(feature="init_calod_test"))]
+	
+	// Initialize the store globally using call_once (happens only once)
+	// 1. Load the config from the env or json config file
+	// 2. Acquire write lock on store
+	// 3. Initialize the store with new structs
 	fn initialize() {
 		INIT.call_once(|| unsafe {
-			STORE = Some(CalodStore {
+			let config = Config::from_env_or_file().expect("Failed to load config");
+
+			let mut store = STORE.write().unwrap();
+			*store = Some(CalodStore {
 				data: DashMap::new(),
-				lru_queue: VecDeque::new(),
-				datetime: DashMap::new(),
+				lru_queue: Arc::new(Mutex::new(VecDeque::new())),
+				capacity: AtomicUsize::new(config.cache_capacity),
 			});
-			INIT_COUNT += 1;
-			println!("Store is initialized.");
+			println!("Store is initialized with capacity: {}", config.cache_capacity);
 		});
 	}
 
-	#[cfg(feature="init_calod_test")]
-	fn initialize() {
-		unsafe {
-			STORE = Some(CalodStore {
-				data: HashMap::new(),
-				datetime: HashMap::new(),
-			});
-			INIT_COUNT += 1;
-		}
-		println!("Store is initialized in test mode.");
-	}
 
-	fn get_store() -< Result<&'static mut CalodStore, CacheError> {
-		unsafe {
-			if STORE.is_none() {
-				return Err(CacheError::StoreNotInitialized);
-			}
-			Ok(STORE.as_mut().unwrap());
+	// Retreive the store instance from the global variable
+	// 1. Acquire read lock on the `STORE`
+	// 2. If `STORE` is not None (Some), return a clone of Arc (Reference)
+	// 3. Return an error is `STORE` is none
+	fn get_store() -> Result<&'static mut CalodStore, CacheError> {
+		let store = STORE.read().unwrap();
+		if let Some(store) = store.as_ref() {
+			Ok(Arc::clone(store))
+		} else {
+			Err(CacheError::StoreNotInitialized)
 		}
 	}
 
+
+	// Retreive a value from the Calod Cache
+	// 1. Check if the key exists in the `DashMap` -> Return KeyNotFound Error
+	// 2. Check if the key has expired -> Return KeyExpired Error
+	// 3. Get the `CacheEntry` from the cache
+	// 4. Update the access meta `frequency` and `last_accessed`
+	// 5. Move the key in the front of the LRU eviction queue
+	// 6. Return the value store in cache entry
 	fn get(&self, key: &str) -> Result<Option<&str>, CacheError> {
-
 		if !self.data.contains_key(key) {
 			return Err(CacheError::KeyNotFound(key.to_string()));
 		}
@@ -108,11 +115,12 @@ impl Store for CalodStore {
 			return Err(CacheError::KeyExpired(key.to_string()));
 		}
 
-		if let Some(entry) = self.data.get_mut(key) {
+		if let Some(mut entry) = self.data.get_mut(key) {
 			entry.frequency += 1;
 			entry.last_accessed = Utc::now();
 
-			// move the key to the front of the LRU queue
+			// Move the key to the front of the LRU queue
+			let mut lru_queue = self.lru_queue.lock().unwrap();
 			self.lru_queue.retain(|k| k != key);
 			self.lru_queue.push_front(key.to_string());
 
@@ -122,14 +130,20 @@ impl Store for CalodStore {
 		}
 	}
 
-	fn set(&mut self, key: &str, value: &str, opt: &Option<SetOptionalArgs>) -> Option<DataType> {
+	// Insert/Update a value in the Calod cache
+	// 1. Check if the cache capacity is full, if yes evict
+	// 2. Calculate TTL of the `CacheEntry`
+	// 3. Insert the cache entry into the `DashMap`
+	// 4. Move the key to front of LRU eviction queue
+	// 6. Return the old value of existed (in case update)
+	fn set(&mut self, key: &str, value: &DataType, opt: &Option<SetOptionalArgs>) -> Option<DataType> {
 		if self.data.len() >= self.capacity {
 			self.evict();
 		}
 
-		let ttl_datetime = opt.ttl.map(|t| Utc::now() + t);
+		let ttl_datetime = opt.map(|t| Utc::now() + t);
 		let entry = CacheEntry {
-			value: value.to_string(),
+			value: value.clone(),
 			frequency: 1,
 			last_accessed: Utc::now(),
 			ttl: ttl_datetime,
@@ -141,9 +155,14 @@ impl Store for CalodStore {
 		// Move the key to the front of the LRU queue
 		self.lru_queue.push_front(key.to_string());
 
-		Ok(old_entry)
+		Ok(old_entry.map(|e| e.value))
 	}
 
+	// Evict and entry from the cache LRU/LFU/Predictive Weights
+	// 1. Iterate through the LRU queue to calculate priority scores
+	// 2. Calcaulate Weights LRU + LFU + Predictive
+	// 3. Push the entry onto the min heap
+	// 4. Pop the lowest priority entry from the heap and evict it
 	fn evict(&mut self) {
 		let mut heap = BinaryHeap::new();
 
@@ -166,16 +185,21 @@ impl Store for CalodStore {
 		}
 	}
 
+	// Calculate the LRU weight
+	// 1. Calculate the time since last accessed
 	fn calculate_lru_weight(&self, entry: &CacheEntry) -> f64 {
 		let now = Utc::now();
 		let duration_since_last_access = now - entry.last_accessed;
 		duration_since_last_access.num_milliseconds() as f64;
 	}
 
+	// Calculate the LFU weight using inverse of frequency
+	// Add 1.0 to avoid Divide by Zero
 	fn calculate_lfu_weight(&self, entry: &CacheEntry) -> f64 {
 		1.0 / (entry.frequency as f64 + 1.0)
 	}
 
+	// Calculate the Predictive weight based on TTL
 	fn calculate_predictive_weight(&self, entry: &CacheEntry) -> f64 {
 		if let Some(ttl) = entry.ttl {
 			let now = Utc::now();
@@ -191,6 +215,7 @@ impl Store for CalodStore {
 		0.0
 	}  
 
+	// Check if key is expired based on ttl
 	fn is_key_expired(&self, key: &str) -> Result<bool, CacheError> {
 		let now = Utc::now();
 
@@ -204,22 +229,29 @@ impl Store for CalodStore {
 		Err(CacheError::KeyNotFound(key.to_string()))
 	}
 
+	// Delete Cache Entries from CalodStore and LRU -> Iterate and delete
 	fn delete(&mut self, keys: Vec<&str>) -> Result<u64, CacheError> {
 		let mut delete_count = 0;
 		
 		for key in keys {
-			let key_str = key.to_string();
-			let removed_data = self.data.remove(key_str.as_str());
-			
+			if self.data.remove(key).is_some() {
+				self.lru_queue.retain(|k| k != key);
+				delete_count += 1;
+			}
 		}
+
+		Ok(delete_count)
 	}
 
+	// Invalidate keys form the cache
+	// 1. Iterate through the cache entries, checking the TTL and add them to the vec
+	// 2. Delete them for fuck sake!
 	fn invalidate(&self) {
 		let now = Utc::now();
 		let mut keys_to_remove = Vec::new();
 
-		for entry in self.datetime.iter() {
-			if let Some(expire_at) = entry.value().expire_at {
+		for entry in self.data.iter() {
+			if let Some(expire_at) = entry.ttl {
 				if expire_at < now {
 					keys_to_remove.push(entry.key().clone());
 				}
@@ -228,22 +260,44 @@ impl Store for CalodStore {
 
 		for key in keys_to_remove {
 			self.data.remove(&key);
-			self.datetime.remove(&key);
 			println!("Invalidation: Key {} has been removed.", key);
 		}
+	}
+
+	pub fn increment_request_count(&mut self) {
+		self.request_count += 1;
+	}
+
+	pub fn get_stats(&self) -> String {
+		let uptime = self.start_time.elapsed();
+		let response_time_avg = self.calculate_avg_response_time();
+
+		format!("Uptime: {:?}\nRequests Handled: {}\nAverage Response Time: {:?}", uptime, self.request_count, response_time_avg)
 	}
 }
 
 impl CalodStore {
 	pub fn reset() {
 		unsafe {
-			if let Some(mut store) = STORE.take() {
-				store.data.clear();
-				INIT_COUNT = 0;
+			let mut store = STORE.write().unwrap();
+			if let Some(mut s) = store.take() {
+				s.data.clear();
 				println!("Store is reset.");
 			} else {
 				println!("Store is already reset.");
 			}
 		}
+	}
+
+	pub fn load_from_file(file_path: &str) -> Result<Self> {
+		let file_content = fs::read_to_string(file_path)?;
+		let store: CalodStore = serde_json::from_str(&file_content)?;
+		Ok(store)
+	}
+
+	pub fn save_to_file(&self, file_path: &str) -> Result<()> {
+		let json_data = serde_json::to_string(self)?;
+		fs::write(file_path, json_data)?;
+		Ok(())
 	}
 }
