@@ -4,3 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+dashmap = "6.1.0"
+serial_test = "3.1.1"
+thiserror = "1.0.64"
+tokio = { version = "1", features = ["full"] }
