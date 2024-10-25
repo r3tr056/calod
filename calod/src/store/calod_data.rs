@@ -1,4 +1,5 @@
-use dashmap::DashMap;
+use std::collections::{HashMap, LinkedList, VecDeque};
+use dashmap::{DashSet, DashMap};
 use chrono::{DateTime, Utc};
 
 // CacheEntry struct
@@ -8,6 +9,12 @@ pub struct CacheEntry {
 	frequency: u32,
 	last_accessed: DateTime<Utc>,
 	ttl: Option<DateTime<Utc>>,
+}
+
+impl CacheEntry {
+	pub fn is_expired(&self) -> bool {
+		self.ttl.map(|expire| Utc::now() > expire).unwrap_or(false)
+	}
 }
 
 struct CacheEntryWithScore {
@@ -20,6 +27,14 @@ impl Ord for CacheEntryWithScore {
 		self.score.partial_cmp(&other.score).unwrap()
 	}
 }
+
+impl Ord for CacheEntryWithScore {
+	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+		self.score.partial_cmp(&other.score).unwrap()
+	}
+}
+
+impl Eq for CacheEntryWithScore {}
 
 impl PartialOrd for CacheEntryWithScore {
 	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -41,6 +56,23 @@ pub enum DataType {
 	List(LinkedList<String>),
 	Set(Set),
 	Hash(Hash),
+
+	Object {
+		data: Vec<u8>,
+		type_info: TypeInfo,
+	}
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeInfo {
+	type_name: String,
+	type_id: u64,
+}
+
+impl TypeInfo {
+	pub fn is_valid(&self) -> bool {
+		!self.type_name.is_empty() && self.type_id > 0
+	}
 }
 
 #[derive(Debug)]
@@ -56,20 +88,20 @@ pub struct LinkedListNode {
 
 #[derive(Debug)]
 pub struct Set {
-	data: DashMap<String, ()>,
+	data: DashSet<String>,
 }
 
 impl Set {
 	pub fn new() -> Self {
-		Set { data: DashMap::new(), }
+		Set { data: DashSet::new(), }
 	}
 
 	pub fn insert(&self, value: String) {
-		self.data.insert(value, ());
+		self.data.insert(value);
 	}
 
 	pub fn contains(&self, value: &str) -> bool {
-		self.data.contains_key(value)
+		self.data.contains(value)
 	}
 
 	pub fn remove(&self, value: &str) {
@@ -92,7 +124,7 @@ impl Hash {
 	}
 
 	pub fn get(&self, key: &str) -> Option<String> {
-		self.data.get(key).map(|entry| entry.clone())
+		self.data.get(key).map(|entry| entry.value().clone())
 	}
 
 	pub fn remove(&self, key: &str) {
@@ -112,14 +144,14 @@ pub struct DateTimeMetaBuilder {
 }
 
 impl DateTimeMetaBuilder {
-	pub fn new(created_at: DateTime<Utc>) -> DateTimeMetaBuilder {
+	pub fn new(created_at: DateTime<Utc>) -> Self {
 		DateTimeMetaBuilder {
 			created_at,
 			expire_at: None
 		}
 	}
 
-	pub fn expire_at(mut self, expire_at: Option<DateTime<Utc>>) -> DateTimeMetaBuilder {
+	pub fn expire_at(mut self, expire_at: Option<DateTime<Utc>>) -> Self {
 		self.expire_at = expire_at;
 		self
 	}
