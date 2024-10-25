@@ -1,6 +1,6 @@
 # CALOD (Cache-a-lot-o-data)
 
-![CALOD Logo](link_to_your_logo) <!-- Replace with your logo link -->
+![CALOD Logo](https://raw.githubusercontent.com/r3tr056/calod/refs/heads/dev/.github/images/logo.jpeg)
 
 **CALOD** is an ultra-fast caching solution designed to handle a lot of data
 with ultra-low latency network calls. With its predictive cache invalidation,
@@ -44,10 +44,10 @@ enhancing performance and user experience.
 
    ```json
    {
-       "port": 8995,
-       "maxSize": 1000,
-       "predictiveInvalidation": true,
-       "ttl": 3600
+     "port": 8995,
+     "maxSize": 1000,
+     "predictiveInvalidation": true,
+     "ttl": 3600
    }
    ```
 
@@ -97,9 +97,9 @@ Configure CALOD according to your needs by adjusting options in
 
 ```json
 {
-    "maxSize": 1000, // Maximum number of items in the cache
-    "predictiveInvalidation": true, // Enable predictive cache invalidation
-    "ttl": 3600 // Default time-to-live for cache items in seconds
+  "maxSize": 1000, // Maximum number of items in the cache
+  "predictiveInvalidation": true, // Enable predictive cache invalidation
+  "ttl": 3600 // Default time-to-live for cache items in seconds
 }
 ```
 
