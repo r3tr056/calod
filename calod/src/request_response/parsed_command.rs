@@ -5,7 +5,7 @@ use crate::request_response::{command::Command};
 #[derive(Debug, PartialEq)]
 pub struct ParsedCommand {
 	pub command: Option<Command>,
-	pub args: Vec<String>,
+	pub args: Vec<&str>,
 }
 
 impl ParsedCommand {
