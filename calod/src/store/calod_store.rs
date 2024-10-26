@@ -41,7 +41,7 @@ pub enum CacheError {
 #[derive(Debug)]
 pub struct CalodStore {
 	start_time: Instant,
-	request_count: u64,
+	request_count: AtomicUsize,
 	data: DashMap<String, CacheEntry>,
 	lru_queue: Arc<Mutex<VecDeque<String>>>,
 	capacity: AtomicUsize,
