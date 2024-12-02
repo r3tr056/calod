@@ -303,16 +303,4 @@ impl CalodStore {
             println!("Store is already reset.");
         }
     }
-
-    // pub fn load_from_file(file_path: &str) -> Result<Self, Error> {
-    //     let file_content = fs::read_to_string(file_path)?;
-    //     let store: CalodStore = serde_json::from_str(&file_content)?;
-    //     Ok(store)
-    // }
-
-    // pub fn save_to_file(&self, file_path: &str) -> Result<()> {
-    //     let json_data = serde_json::to_string(self)?;
-    //     fs::write(file_path, json_data)?;
-    //     Ok(())
-    // }
 }
