@@ -1,3 +1,20 @@
+use serde_json;
+use tracing::error;
+use std::convert::TryFrom;
+use thiserror::Error;
+
+use crate::parser::parser::Value;
+
+#[derive(Debug, Error)]
+pub enum CommandError {
+    #[error("Invalid command format")]
+    InvalidFormat,
+    #[error("Invalid argument: {0}")]
+    InvalidArgument(String),
+    #[error("JSON parse error: {0}")]
+    JsonError(#[from] serde_json::Error),
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Command {
     // Generic
@@ -152,181 +169,121 @@ pub enum Command {
         key: String,
         path: String,
     },
+    Unknown(String),
 }
 
-impl Command {
-    pub fn from(input: &str, args: Vec<&str>) -> Result<Command, String> {
-        match input.to_uppercase().as_str() {
-            // Generic Commands
-            "KEYS" if args.len() == 1 => Ok(Command::Keys {
-                pattern: args[0].to_string(),
-            }),
-            "EXISTS" if args.len() == 1 => Ok(Command::Keys {
-                pattern: args[0].to_string(),
-            }),
-            "EXPIRE" if args.len() == 2 => {
-                let seconds = args[1].parse().map_err(|_| "Invalid seconds".to_string())?;
-                Ok(Command::Expire {
-                    key: args[0].to_string(),
-                    seconds,
-                })
+impl TryFrom<&[Value]> for Command {
+    type Error = &'static str;
+
+    fn try_from(values: &[Value]) -> Result<Self, Self::Error> {
+        if values.is_empty() {
+            return Err("Empty Command");
+        }
+
+        match &values[0] {
+            Value::BulkString(bs) => {
+                match std::str::from_utf8(bs) {
+                    Ok(command_str) => {
+                        let command_upper = command_str.to_uppercase();
+                        match command_upper.as_str() {
+                            "PING" => {
+                                if values.len() == 1 {
+                                    Ok(Command::Ping {  })
+                                } else {
+                                    Err("PING command expectes no arguments")
+                                }
+                            }
+                            "SET" => {
+                                if values.len() == 3 {
+                                    if let Value::BulkString(key_bs) = &values[1] {
+                                        if let Value::BulkString(value_bs) = &values[2] {
+                                            let key = String::from_utf8_lossy(key_bs).into_owned();
+                                            let value = String::from_utf8_lossy(value_bs).into_owned();
+                                            Ok(Command::Set { key, value })
+                                        } else {
+                                            Err("SET command value must be a bulk string")
+                                        }
+                                    } else {
+                                        Err("SET command key must be a bulk string")
+                                    }
+                                } else {
+                                    Err("SET command expects exactly two arguments (key and value)")
+                                }
+                            }
+                            "GET" => {
+                                if values.len() == 2 {
+                                    if let Value::BulkString(key_bs) = &values[1] {
+                                        let key = String::from_utf8_lossy(key_bs).into_owned();
+                                        Ok(Command::Get { key })
+                                    } else {
+                                        Err("GET command argument must be a bulk string")
+                                    }
+                                } else {
+                                    Err("GET command expects exactly one argument (key)")
+                                }
+                            }
+                            "INFO" => {
+                                if values.len() <= 2 {
+                                    let section = if values.len() == 2 {
+                                        if let Value::BulkString(section_bs) = &values[1] {
+                                            String::from_utf8_lossy(section_bs).into_owned()
+                                        } else {
+                                            return Err("INFO command section must be a bulk string");
+                                        }
+                                    } else {
+                                        "default".to_string() // Default section if none provided
+                                    };
+                                    Ok(Command::Info { section })
+                                } else {
+                                    Err("INFO command expects at most one argument (section)")
+                                }
+                            }
+                            "EXISTS" => {
+                                if values.len() == 2 {
+                                    if let Value::BulkString(key_bs) = &values[1] {
+                                        let key = String::from_utf8_lossy(key_bs).into_owned();
+                                        Ok(Command::Exists { key })
+                                    } else {
+                                        Err("EXISTS command argument must be a bulk string")
+                                    }
+                                } else {
+                                    Err("EXISTS command expects exactly one argument (key)")
+                                }
+                            }
+                            "DEL" => {
+                                if values.len() == 2 {
+                                    if let Value::BulkString(key_bs) = &values[1] {
+                                        let key = String::from_utf8_lossy(key_bs).into_owned();
+                                        Ok(Command::Del { key })
+                                    } else {
+                                        Err("DEL command argument must be a bulk string")
+                                    }
+                                } else {
+                                    Err("DEL command expects exactly one argument (key)")
+                                }
+                            }
+                            "KEYS" => {
+                                if values.len() == 2 {
+                                    if let Value::BulkString(pattern_bs) = &values[1] {
+                                        let pattern = String::from_utf8_lossy(pattern_bs).into_owned();
+                                        Ok(Command::Keys { pattern })
+                                    } else {
+                                        Err("KEYS command argument must be a bulk string")
+                                    }
+                                } else {
+                                    Err("KEYS command expects exactly one argument (pattern)")
+                                }
+                            }
+                            _ => Ok(Command::Unknown(command_str.to_string())),
+                        }
+                    }
+                    Err(_) => {
+                        error!("Failed to parse command string from bulk string: {:?}", bs);
+                        Err("Invalid command string encoding")
+                    },
+                }
             }
-            "TTL" if args.len() == 1 => Ok(Command::Ttl {
-                key: args[0].to_string(),
-            }),
-            "PERSIST" if args.len() == 1 => Ok(Command::Persist {
-                key: args[0].to_string(),
-            }),
-            "SCAN" if args.len() == 3 => {
-                let cursor = args[0].parse().map_err(|_| "Invalid cursor".to_string())?;
-                let count = args[2].parse().map_err(|_| "Invalid count".to_string())?;
-                Ok(Command::Scan {
-                    cursor,
-                    pattern: args[1].to_string(),
-                    count,
-                })
-            }
-
-            "DEL" if args.len() == 1 => Ok(Command::Del {
-                key: args[0].to_string(),
-            }),
-            "INFO" if args.len() == 1 => Ok(Command::Info {
-                section: args[0].to_string(),
-            }),
-
-            // Strings/Numbers
-            "SET" if args.len() == 2 => Ok(Command::Set {
-                key: args[0].to_string(),
-                value: args[1].to_string(),
-            }),
-            "GET" if args.len() == 1 => Ok(Command::Get {
-                key: args[0].to_string(),
-            }),
-            // TODO : Fix MGET
-            "MGET" => Ok(Command::MGet {
-                key: args[0].to_string(),
-            }),
-            "INCR" if args.len() == 1 => Ok(Command::Incr {
-                key: args[0].to_string(),
-            }),
-            "DECR" if args.len() == 1 => Ok(Command::Decr {
-                key: args[0].to_string(),
-            }),
-
-            // Hashes
-            "HSET" if args.len() == 3 => Ok(Command::HSet {
-                key: args[0].to_string(),
-                field: args[1].to_string(),
-                value: args[2].to_string(),
-            }),
-            "HGET" if args.len() == 2 => Ok(Command::HGet {
-                key: args[0].to_string(),
-                field: args[1].to_string(),
-            }),
-            "HGETALL" if args.len() == 1 => Ok(Command::HGetAll {
-                key: args[0].to_string(),
-            }),
-            "HDEL" if args.len() == 2 => Ok(Command::HDel {
-                key: args[0].to_string(),
-                field: args[1].to_string(),
-            }),
-            "HMGET" if args.len() >= 2 => Ok(Command::HMGet {
-                key: args[0].to_string(),
-                field: args[1].to_string(),
-            }),
-
-            // Sets
-            "XADD" if args.len() == 2 => Ok(Command::XAdd {
-                key: args[0].to_string(),
-                member: args[1].to_string(),
-            }),
-            "XREAD" if args.len() == 1 => Ok(Command::XRead {
-                key: args[0].to_string(),
-            }),
-            "XDEL" if args.len() == 1 => Ok(Command::XDel {
-                key: args[0].to_string(),
-            }),
-            "XTRIM" if args.len() == 2 => {
-                let maxlen = args[1].parse().map_err(|_| "Invalid maxlen".to_string())?;
-                Ok(Command::XTrim {
-                    key: args[0].to_string(),
-                    maxlen,
-                })
-            }
-            "XREM" if args.len() == 2 => Ok(Command::XRem {
-                key: args[0].to_string(),
-                member: args[1].to_string(),
-            }),
-
-            // Sorted Sets
-            "ZADD" if args.len() == 3 => {
-                let score = args[1].parse().map_err(|_| "Invalid score".to_string())?;
-                Ok(Command::ZAdd {
-                    key: args[0].to_string(),
-                    score,
-                    memeber: args[2].to_string(),
-                })
-            }
-            "ZRANGE" if args.len() == 3 => {
-                let start = args[1].parse().map_err(|_| "Invalid start".to_string())?;
-                let stop = args[2].parse().map_err(|_| "Invalid stop".to_string())?;
-                Ok(Command::ZRange {
-                    key: args[0].to_string(),
-                    start,
-                    stop,
-                })
-            }
-
-            // Lists
-            "LPUSH" if args.len() == 2 => Ok(Command::ListLPush {
-                key: args[0].to_string(),
-                value: args[1].to_string(),
-            }),
-            "RPUSH" if args.len() == 2 => Ok(Command::ListRPush {
-                key: args[0].to_string(),
-                value: args[1].to_string(),
-            }),
-            "LRANGE" if args.len() == 3 => {
-                let start = args[1].parse().map_err(|_| "Invalid start".to_string())?;
-                let end = args[2].parse().map_err(|_| "Invalid end".to_string())?;
-                Ok(Command::ListLRange {
-                    key: args[0].to_string(),
-                    start,
-                    end,
-                })
-            }
-
-            // Streams
-            "XADD" if args.len() == 2 => Ok(Command::StreamXAdd {
-                key: args[0].to_string(),
-                value: args[1].to_string(),
-            }),
-            "XRANGE" if args.len() == 3 => {
-                let start = args[1].parse().map_err(|_| "Invalid start".to_string())?;
-                let end = args[2].parse().map_err(|_| "Invalid end".to_string())?;
-                Ok(Command::StreamXRange {
-                    key: args[0].to_string(),
-                    start,
-                    end,
-                })
-            }
-
-            // JSON
-            "JSON.SET" if args.len() == 3 => {
-                let value: serde_json::Value =
-                    serde_json::from_str(args[2]).map_err(|e| e.to_string())?;
-                Ok(Command::JsonSet {
-                    key: args[0].to_string(),
-                    path: args[1].to_string(),
-                    value,
-                })
-            }
-            "JSON.GET" if args.len() == 2 => Ok(Command::JsonGet {
-                key: args[0].to_string(),
-                path: args[1].to_string(),
-            }),
-
-            _ => Err(format!("Unknown command or incorrect arguments: {}", input)),
+            _ => Err("Command must start with a bulk string"),
         }
     }
 }
