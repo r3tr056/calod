@@ -1,306 +1,404 @@
-use chrono::Utc;
+use chrono::Duration as ChronoDuration;
 use dashmap::DashMap;
-use once_cell::sync::Lazy;
+use tokio::sync::Mutex;
 use std::collections::{BinaryHeap, VecDeque};
-use std::sync::atomic::AtomicUsize;
-use std::sync::RwLock;
-use std::sync::{Arc, Mutex, Once};
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{Ordering, AtomicUsize};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use thiserror::Error;
+use twox_hash::XxHash64;
+use tracing::{debug, error, info};
 
-use crate::config::Config;
-use crate::store::calod_data::{CacheEntry, CacheEntryWithScore};
+use bincode::{serialize, deserialize};
+use tokio::fs::{read, write};
+use crate::store::calod_data::{CacheEntry, EvictionCandidate};
 
 use super::calod_data::DataType;
+use super::config::CacheConfig;
+use super::metrics::CalodMetrics;
 
-static STORE: Lazy<RwLock<Option<CalodStore>>> = Lazy::new(|| RwLock::new(None));
-static INIT: Once = Once::new();
-
-#[derive(Debug)]
-pub struct SetOptionalArgs {
-    pub ttl: Duration,
-}
-
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum CacheError {
     #[error("Key `{0}` not found")]
     KeyNotFound(String),
-
-    #[error("Store is not initialized")]
-    StoreNotInitialized,
-
     #[error("Key `{0}` has expired")]
     KeyExpired(String),
-
-    #[error("Invalid TTL value provided")]
-    InvalidTtl,
+    #[error("Invalid command arguments: {0}")]
+    InvalidCommandArguments(String),
+    #[error("Command not implemented: {0}")]
+    CommandNotImplemented(String),
+    #[error("Internal cache error: {0}")]
+    InternalError(String),
 }
 
-#[derive(Debug, Clone)]
-pub struct CalodStore {
-    start_time: Instant,
-    request_count: Arc<AtomicUsize>,
+
+#[derive(Debug)]
+pub enum PersistenceError {
+    IoError(std::io::Error),
+    SerializationError(bincode::Error),
+}
+
+type ShardIndex = usize;
+
+pub struct ShardedStore {
+    shards: Vec<Arc<CalodShard>>,
+    metrics: Arc<CalodMetrics>,
+    config: CacheConfig
+}
+
+#[async_trait::async_trait]
+pub trait CachePersistence {
+    async fn save(&self, path: &str) -> Result<(), PersistenceError>;
+    async fn load(&self, path: &str) -> Result<(), PersistenceError>;
+}
+
+impl ShardedStore {
+    pub fn new(config: CacheConfig) -> Self {
+        let metrics = Arc::new(CalodMetrics::default());
+        let per_shard_cap = (config.capacity + config.shards - 1) / config.shards;
+
+        let shards = (0..config.shards).map(|_| Arc::new(CalodShard::new(per_shard_cap, metrics.clone()))).collect();
+
+        Self {
+            shards,
+            config,
+            metrics
+        }
+    }
+
+    pub async fn ping(&self) -> String {
+        "+PONG\r\n".to_string()
+    }
+
+    pub async fn info(&self, _section: Option<&str>) -> String {
+        let metrics_report = self.metrics.report();
+        format!("{}\r\n", metrics_report)
+    }
+
+    #[inline]
+    fn get_shard_index<K: Hash + ?Sized>(&self, key: &K) -> ShardIndex where K:AsRef<[u8]> {
+        let mut hasher = XxHash64::default();
+        key.hash(&mut hasher);
+        (hasher.finish() % self.shards.len() as u64) as usize
+    }
+
+    pub async fn get(&self, key: &str) -> Result<DataType, CacheError> {
+        let start = Instant::now();
+        let shard_idx = self.get_shard_index(key);
+        let result = self.shards[shard_idx].get(key).await;
+
+        if self.config.metrics_enabled {
+            let latency = start.elapsed();
+            self.metrics.record_read(latency);
+
+            match &result {
+                Ok(_) => self.metrics.record_hit(),
+                Err(CacheError::KeyNotFound(_)) => self.metrics.record_miss(),
+                _ => (),
+            }
+        }
+
+        result
+    }
+
+    pub async fn set(&self, key: String, value: DataType, ttl: Option<ChronoDuration>) -> Option<DataType> {
+        let start = Instant::now();
+        let shard_idx = self.get_shard_index(&key);
+        let result = self.shards[shard_idx].set(key, value, ttl).await;
+
+        if self.config.metrics_enabled {
+            let latency = start.elapsed();
+            self.metrics.record_write(latency);
+        }
+
+        result
+    }
+
+    pub async fn delete(&self, key: &str) -> bool {
+        let shard_idx = self.get_shard_index(key);
+        self.shards[shard_idx].delete(key).await
+    }
+
+    pub async fn exists(&self, key: &str) -> bool {
+        let shard_idx = self.get_shard_index(key);
+        self.shards[shard_idx].exists(key).await
+    }
+
+    pub async fn keys(&self, pattern: &str) -> Vec<String> {
+        let mut all_keys = Vec::new();
+        for shard in &self.shards {
+            all_keys.extend(shard.keys(pattern).await);
+        }
+        all_keys
+    }
+
+    pub async fn expire(&self, key: &str, seconds: u64) -> Result<bool, CacheError> {
+        let shard_idx = self.get_shard_index(key);
+        self.shards[shard_idx].exipre(key, seconds).await
+    }
+
+    pub async fn ttl(&self, key: &str) -> Result<Option<i64>, CacheError> {
+        let shard_idx = self.get_shard_index(key);
+        self.shards[shard_idx].ttl(key).await
+    }
+
+    pub async fn persist(&self, key: &str) -> Result<bool, CacheError> {
+        let shard_idx = self.get_shard_index(key);
+        self.shards[shard_idx].persist(key).await
+    }
+
+    // pub async fn atomic_incr(&self, key: &str) -> Result<i64, CacheError> {
+    //     let shard_idx = self.get_shard_index(key);
+    //     let shard = &self.shards[shard_idx];
+
+    //     let mut entry = shard.data.entry(key.to_string()).or_insert(CacheEntry::new(DataType::Int(0), None));
+
+    //     match &mut entry.value {
+    //         DataType::Int(n) => {
+    //             *n += 1;
+    //             Ok(*n)
+    //         }
+    //         _ => Err(CacheError::KeyNotFound(key.to_string())),
+    //     }
+    // }
+
+    // pub async fn hset(&self, key: &str, field: &str, value: String) -> bool {
+    //     let shard_idx = self.get_shard_index(key);
+    //     let shard = &self.shards[shard_idx];
+
+    //     let mut hash = shard.data.entry(key.to_string()).or_insert(DashMap::new());
+
+    //     hash.insert(field.to_string(), value).is_none()
+    // }
+
+    pub fn metrics(&self) -> String {
+        self.metrics.report()
+    }
+}
+
+#[async_trait::async_trait]
+impl CachePersistence for ShardedStore {
+    async fn save(&self, path: &str) -> Result<(), PersistenceError> {
+        let mut handles = Vec::new();
+
+        for (i, shard) in self.shards.iter().enumerate() {
+            let shard = Arc::clone(shard);
+            let path = format!("{}/shard_{}.bin", path, i);
+            handles.push(tokio::spawn(async move {
+                shard.save(&path).await
+            }));
+        }
+
+        for handle in handles {
+            handle.await.map_err(|e| PersistenceError::IoError(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Join error: {}", e)
+            )))??;
+        }
+
+        Ok(())
+    }
+    
+    async fn load(&self, path: &str) -> Result<(), PersistenceError> {
+        for (i, shard) in self.shards.iter().enumerate() {
+            let path = format!("{}/shard_{}.bin", path, i);
+            shard.load(&path).await?;
+        }
+        Ok(())
+    }
+}
+
+struct CalodShard {
     data: DashMap<String, CacheEntry>,
-    lru_queue: Arc<Mutex<VecDeque<String>>>,
-    capacity: Arc<AtomicUsize>,
+    lru: Mutex<VecDeque<String>>,
+    capacity: AtomicUsize,
+    size: AtomicUsize,
+    metrics: Arc<CalodMetrics>,
 }
 
-impl CalodStore {
-    fn clone(&self) -> Self {
-        CalodStore {
-            start_time: self.start_time.clone(),
-            request_count: Arc::clone(&self.request_count),
-            data: self.data.clone(),
-            lru_queue: Arc::clone(&self.lru_queue),
-            capacity: self.capacity.clone(),
+impl CalodShard {
+    fn new(capacity: usize, metrics: Arc<CalodMetrics>) -> Self {
+        Self {
+            data: DashMap::new(),
+            lru: Mutex::new(VecDeque::new()),
+            capacity: AtomicUsize::new(capacity),
+            size: AtomicUsize::new(0),
+            metrics,
         }
     }
 
-    // Initialize the store globally using call_once (happens only once)
-    // 1. Load the config from the env or json config file
-    // 2. Acquire write lock on store
-    // 3. Initialize the store with new structs
-    pub fn initialize() {
-        INIT.call_once(|| {
-            let config = Config::from_env_or_file().expect("Failed to load config");
-
-            let mut store = STORE.write().unwrap();
-            *store = Some(CalodStore {
-                data: DashMap::new(),
-                lru_queue: Arc::new(Mutex::new(VecDeque::new())),
-                capacity: Arc::new(AtomicUsize::new(config.cache_capacity)),
-                start_time: Instant::now(),
-                request_count: Arc::new(AtomicUsize::new(0)),
-            });
-            println!(
-                "Store is initialized with capacity: {}",
-                config.cache_capacity
-            );
-        });
-    }
-
-    // Retreive the store instance from the global variable
-    // 1. Acquire read lock on the `STORE`
-    // 2. If `STORE` is not None (Some), return a clone of Arc (Reference)
-    // 3. Return an error is `STORE` is none
-    pub fn get_store() -> Result<Arc<Mutex<CalodStore>>, CacheError> {
-        let store = STORE.read().unwrap();
-        if let Some(store_ref) = store.as_ref() {
-            Ok(Arc::new(Mutex::new(store_ref.clone())))
-        } else {
-            Err(CacheError::StoreNotInitialized)
-        }
-    }
-
-    // Retreive a value from the Calod Cache
-    // 1. Check if the key exists in the `DashMap` -> Return KeyNotFound Error
-    // 2. Check if the key has expired -> Return KeyExpired Error
-    // 3. Get the `CacheEntry` from the cache
-    // 4. Update the access meta `frequency` and `last_accessed`
-    // 5. Move the key in the front of the LRU eviction queue
-    // 6. Return the value store in cache entry
-    pub fn get(&self, key: &str) -> Result<Option<DataType>, CacheError> {
-        if !self.data.contains_key(key) {
-            return Err(CacheError::KeyNotFound(key.to_string()));
-        }
-
-        // Check if the key is expired
-        if self.is_key_expired(key)? {
+    async fn get(&self, key: &str) -> Result<DataType, CacheError> {
+        let entry_ref = self.data.get(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
+        let entry = entry_ref.value();
+        if entry.is_expired() {
+            drop(entry_ref);
+            self.data.remove(key);
+            self.size.fetch_sub(1, Ordering::Relaxed);
+            self.remove_from_lru(key).await;
             return Err(CacheError::KeyExpired(key.to_string()));
         }
 
-        if let Some(mut entry) = self.data.get_mut(key) {
-            entry.frequency += 1;
-            entry.last_accessed = Utc::now();
-
-            // Move the key to the front of the LRU queue
-            let mut lru_queue = self.lru_queue.lock().unwrap();
-            // Remove the key from the queue if it exists
-            lru_queue.retain(|k| k != key);
-            // Add the key to the front of the queue
-            lru_queue.push_front(key.to_string());
-
-            Ok(Some(entry.value.clone()))
-        } else {
-            Ok(None)
-        }
+        self.touch_key(key).await;
+        Ok(entry.value.clone())
     }
 
-    // Insert/Update a value in the Calod cache
-    // 1. Check if the cache capacity is full, if yes evict
-    // 2. Calculate TTL of the `CacheEntry`
-    // 3. Insert the cache entry into the `DashMap`
-    // 4. Move the key to front of LRU eviction queue
-    // 6. Return the old value of existed (in case update)
-    pub fn set(
-        &mut self,
-        key: &str,
-        value: &DataType,
-        opt: &Option<chrono::TimeDelta>,
-    ) -> Option<DataType> {
-        if self.data.len() >= self.capacity.load(std::sync::atomic::Ordering::SeqCst) {
-            self.evict();
+    async fn set(&self, key: String, value: DataType, ttl: Option<ChronoDuration>) -> Option<DataType> {
+        if self.size.load(Ordering::Relaxed) >= self.capacity.load(Ordering::Relaxed) {
+            self.evict().await;
         }
+        let entry = CacheEntry::new(value, ttl);
+        let entry_size = entry.size();
+        let old_entry = self.data.insert(key.clone(), entry);
 
-        let ttl_datetime = opt.map(|t| Utc::now() + t);
-        let entry = CacheEntry {
-            value: value.clone(),
-            frequency: 1,
-            last_accessed: Utc::now(),
-            ttl: ttl_datetime,
-        };
+        self.touch_key(&key).await;
+        self.size.fetch_add(1, Ordering::Relaxed);
 
-        // Insert and handle the previous entry properly
-        let old_entry = self.data.insert(key.to_string(), entry);
-
-        // Move the key to the front of the LRU queue
-        {
-            let mut lru_queue = self.lru_queue.lock().unwrap();
-            lru_queue.retain(|k| k != key);
-            lru_queue.push_front(key.to_string());
+        if let Some(old) = &old_entry {
+            self.metrics.total_data_size.fetch_sub(old.size() as u64, Ordering::Relaxed);
         }
+        self.metrics.total_data_size.fetch_add(entry_size as u64, Ordering::Relaxed);
 
         old_entry.map(|e| e.value)
     }
 
-    // Evict and entry from the cache LRU/LFU/Predictive Weights
-    // 1. Iterate through the LRU queue to calculate priority scores
-    // 2. Calcaulate Weights LRU + LFU + Predictive
-    // 3. Push the entry onto the min heap
-    // 4. Pop the lowest priority entry from the heap and evict it
-    fn evict(&mut self) {
-        let mut heap = BinaryHeap::new();
-
-        {
-            let lru_queue = self.lru_queue.lock().unwrap();
-
-            for key in lru_queue.iter() {
-                if let Some(entry_ref) = self.data.get(key) {
-                    let entry = entry_ref.value();
-
-                    let lru_weight = self.calculate_lru_weight(entry);
-                    let lfu_weight = self.calculate_lfu_weight(entry);
-                    let predictive_weight = self.calculate_predictive_weight(entry);
-
-                    // Combine the weights into a single priority score
-                    let total_priority_score = lru_weight + lfu_weight + predictive_weight;
-
-                    heap.push(CacheEntryWithScore {
-                        key: key.clone(),
-                        score: total_priority_score,
-                    });
-                }
-            }
-        }
-
-        if let Some(lowest) = heap.pop() {
-            self.data.remove(&lowest.key);
-            // remove the evicted key for the LRU queue
-            let mut lru_queue = self.lru_queue.lock().unwrap();
-            lru_queue.retain(|k| k != &lowest.key);
-        }
-    }
-
-    // Calculate the LRU weight
-    // 1. Calculate the time since last accessed
-    fn calculate_lru_weight(&self, entry: &CacheEntry) -> f64 {
-        let now = Utc::now();
-        let duration_since_last_access: chrono::TimeDelta = now - entry.last_accessed;
-        duration_since_last_access.num_milliseconds() as f64
-    }
-
-    // Calculate the LFU weight using inverse of frequency
-    // Add 1.0 to avoid Divide by Zero
-    fn calculate_lfu_weight(&self, entry: &CacheEntry) -> f64 {
-        1.0 / (entry.frequency as f64 + 1.0)
-    }
-
-    // Calculate the Predictive weight based on TTL
-    fn calculate_predictive_weight(&self, entry: &CacheEntry) -> f64 {
-        if let Some(ttl) = entry.ttl {
-            let now = Utc::now();
-            let time_until_expiry = ttl - now;
-
-            if time_until_expiry.num_seconds() <= 0 {
-                return f64::MAX;
+    async fn exists(&self, key: &str) -> bool {
+        if let Some(entry_ref) = self.data.get(key) {
+            if !entry_ref.is_expired() {
+                return true;
             } else {
-                return 1.0 / (time_until_expiry.num_milliseconds() as f64);
+                drop(entry_ref);
+                self.data.remove(key);
+                self.size.fetch_sub(1, Ordering::Relaxed);
+                self.remove_from_lru(key).await;
+                return false;
             }
         }
-        // if there's no TTL, we assume it's not expiring soon
-        0.0
+        false
     }
 
-    // Check if key is expired based on ttl
-    fn is_key_expired(&self, key: &str) -> Result<bool, CacheError> {
-        let now = Utc::now();
-
-        if let Some(entry) = self.data.get(key) {
-            if let Some(ttl) = entry.ttl {
-                return Ok(ttl < now);
+    async fn keys(&self, pattern: &str) -> Vec<String> {
+        self.data.iter().filter_map(|entry| {
+            if entry.key().contains(pattern) && !entry.value().is_expired() {
+                Some(entry.key().clone())
+            } else {
+                None
             }
-            return Ok(false);
+        }).collect()
+    }
+
+    async fn exipre(&self, key: &str, seconds: u64) -> Result<bool, CacheError> {
+        let mut entry_writer = self.data.get_mut(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
+        entry_writer.value_mut().expire_in(Duration::from_secs(seconds));
+        Ok(true)
+    }
+
+    async fn ttl(&self, key: &str) -> Result<Option<i64>, CacheError> {
+        let entry_ref = self.data.get(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
+        let entry = entry_ref.value();
+        if entry.is_expired() {
+            drop(entry_ref);        // Drop read guard before deletion
+            self.data.remove(key);
+            self.size.fetch_sub(1, Ordering::Relaxed);
+            self.remove_from_lru(key).await;
+            return Err(CacheError::KeyExpired(key.to_string()));
         }
 
-        Err(CacheError::KeyNotFound(key.to_string()))
+        Ok(entry.ttl().map(|expiry| {
+            expiry.num_seconds()
+        }))
     }
 
-    // Delete Cache Entries from CalodStore and LRU -> Iterate and delete
-    fn delete(&mut self, keys: Vec<&str>) -> Result<u64, CacheError> {
-        let mut delete_count = 0;
+    async fn persist(&self, key: &str) -> Result<bool, CacheError> {
+        let mut entry_writer = self.data.get_mut(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
+        entry_writer.value_mut().persist();
+        Ok(true)
+    }
 
-        for key in keys {
-            if self.data.remove(key).is_some() {
-                let mut lru_queue = self.lru_queue.lock().unwrap();
-                lru_queue.retain(|k| k != key);
-                delete_count += 1;
-            }
+    async fn save(&self, path: &str) -> Result<(), PersistenceError> {
+        let data = self.data.iter().map(|entry| (entry.key().clone(), entry.value().clone())).collect::<Vec<_>>();
+
+        let encoded = serialize(&data).map_err(PersistenceError::SerializationError)?;
+
+        write(path, &encoded).await.map_err(PersistenceError::IoError)?;
+
+        Ok(())
+    }
+
+    async fn load(&self, path: &str) -> Result<(), PersistenceError> {
+        let encoded = read(path).await.map_err(PersistenceError::IoError)?;
+        let data: Vec<(String, CacheEntry)> = deserialize(&encoded).map_err(PersistenceError::SerializationError)?;
+
+        for (key, entry) in data {
+            self.data.insert(key, entry);
         }
 
-        Ok(delete_count)
+        Ok(())
     }
 
-    // Invalidate keys form the cache
-    // 1. Iterate through the cache entries, checking the TTL and add them to the vec
-    // 2. Delete them for fuck sake!
-    fn invalidate(&self) {
-        let now = Utc::now();
-        let mut keys_to_remove = Vec::new();
-
-        for entry in self.data.iter() {
-            if let Some(expire_at) = entry.ttl {
-                if expire_at < now {
-                    keys_to_remove.push(entry.key().clone());
-                }
-            }
-        }
-
-        for key in keys_to_remove {
-            self.data.remove(&key);
-            println!("Invalidation: Key {} has been removed.", key);
-        }
-    }
-
-    pub fn increment_request_count(&mut self) {
-        self.request_count
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    }
-
-    pub fn get_stats(&self) -> String {
-        let uptime = self.start_time.elapsed();
-        format!(
-            "Uptime: {:?}\nRequests Handled: {:?}",
-            uptime, self.request_count
-        )
-    }
-
-    pub fn reset() {
-        let mut store = STORE.write().unwrap();
-        if let Some(s) = store.take() {
-            s.data.clear();
-            println!("Store is reset.");
+    async fn delete(&self, key: &str) -> bool {
+        if self.data.remove(key).is_some() {
+            self.size.fetch_sub(1, Ordering::Relaxed);
+            self.remove_from_lru(key).await;
+            true
         } else {
-            println!("Store is already reset.");
+            false
+        }
+    }
+
+    async fn touch_key(&self, key: &str) {
+        let mut lru = self.lru.lock().await;
+        lru.retain(|k| k != key);
+        lru.push_front(key.to_string());
+    }
+
+    async fn remove_from_lru(&self, key: &str) {
+        let mut lru = self.lru.lock().await;
+        lru.retain(|k| k != key);
+    }
+
+    async fn evict(&self) {
+        let mut candidates = BinaryHeap::new();
+        let lru = self.lru.lock().await;
+
+        for key in lru.iter().rev().take(5) {
+            if let Some(entry) = self.data.get(key) {
+                let score = entry.eviction_score();
+                candidates.push(EvictionCandidate {
+                    key: key.clone(),
+                    score,
+                });
+            }
+        }
+
+        if let Some(candidate) = candidates.pop() {
+            if self.data.remove(&candidate.key).is_some() {
+                self.size.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 }
+
+
+// #[tokio::main]
+// async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//     let config = CacheConfig {
+//         shards: 32,
+//         capacity: 1_000_000,
+//         ..Default::default()
+//     };
+
+//     let cache = ShardedStore::new(config);
+
+//     cache.set("key1".to_string(), DataType::String("Value".into()), None).await;
+//     // Get metrics
+//     println!("{}", cache.metrics());
+    
+//     // Save state
+//     cache.save("./cache_backup").await?;
+     
+//     // Load state
+//     cache.load("./cache_backup").await?;
+ 
+//     Ok(())
+// }
