@@ -1,56 +1,112 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc, Duration as ChronoDuration};
 use dashmap::{DashMap, DashSet};
-use serde_derive::{Deserialize, Serialize};
+use serde_with::serde_as;
+use core::f64;
 use std::collections::LinkedList;
+use serde::{Serialize, Deserialize};
 
 // CacheEntry struct
-#[derive(Debug, Clone)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CacheEntry {
+    #[serde(flatten)]
     pub value: DataType,
-    pub frequency: u32,
-    pub last_accessed: DateTime<Utc>,
-    pub ttl: Option<DateTime<Utc>>,
+    #[serde(with = "chrono::serde::ts_milliseconds")]
+    pub created_at: DateTime<Utc>,
+    #[serde(with = "chrono::serde::ts_milliseconds_option")]
+    pub expires_at: Option<DateTime<Utc>>,
+    size_bytes: usize,
 }
 
 impl CacheEntry {
+    pub fn new(value: DataType, ttl: Option<ChronoDuration>) -> Self {
+        let created_at = Utc::now();
+        let expires_at = ttl.map(|duration| created_at + duration);
+        let size_bytes = value.size();
+
+        Self { value, expires_at, created_at, size_bytes }
+    }
+
+    pub fn size(&self) -> usize {
+        self.size_bytes
+    }
+
     pub fn is_expired(&self) -> bool {
-        self.ttl.map(|expire| Utc::now() > expire).unwrap_or(false)
+        self.expires_at.map_or(false, |exp| exp <= Utc::now())
+    }
+
+    pub fn eviction_score(&self) -> f64 {
+        let age = Utc::now().timestamp_millis() - self.created_at.timestamp_millis();
+        age as f64 * 0.7 + (self.expires_at.map_or(f64::MAX, |exp| (exp - Utc::now()).num_seconds() as f64) * 0.3)
+    }
+
+    pub fn expire_in(&mut self, duration: std::time::Duration) {
+        self.expires_at = Some(Utc::now() + ChronoDuration::from_std(duration).unwrap_or(ChronoDuration::max_value()));
+    }
+
+    pub fn ttl(&self) -> Option<ChronoDuration> {
+        self.expires_at.map(|expiry_time| {
+            let now = Utc::now();
+            expiry_time - now
+        })
+    }
+
+    pub fn persist(&mut self) {
+        self.expires_at = None;
     }
 }
 
-pub struct CacheEntryWithScore {
+#[derive(Debug)]
+pub struct EvictionCandidate {
     pub key: String,
     pub score: f64,
 }
 
-impl Ord for CacheEntryWithScore {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.score.partial_cmp(&other.score).unwrap()
-    }
-}
-
-impl Eq for CacheEntryWithScore {}
-
-impl PartialOrd for CacheEntryWithScore {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl PartialEq for CacheEntryWithScore {
+impl PartialEq for EvictionCandidate {
     fn eq(&self, other: &Self) -> bool {
         self.score == other.score
     }
 }
 
-#[derive(Debug, Clone)]
+impl Eq for EvictionCandidate {}
+
+impl PartialOrd for EvictionCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.score.partial_cmp(&other.score)
+    }
+}
+
+impl Ord for EvictionCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
+    }
+}
+
+#[serde_as]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
 pub enum DataType {
     String(String),
     List(LinkedList<String>),
-    Set(Set),
-    Hash(Hash),
+    Set(#[serde(with = "serde_dashset")] DashSet<String>),
+    Hash(#[serde(with = "serde_dashmap")] DashMap<String, String>),
+    Object {
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+        type_info: TypeInfo,
+    },
+}
 
-    Object { data: Vec<u8>, type_info: TypeInfo },
+impl DataType {
+    fn size(&self) -> usize {
+        match self {
+            DataType::String(s) => s.len(),
+            DataType::List(linked_list) => linked_list.len(),
+            DataType::Set(dash_set) => dash_set.len(),
+            DataType::Hash(dash_map) => dash_map.len(),
+            DataType::Object { data, type_info: _ } => data.len(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -115,15 +171,25 @@ impl Hash {
     }
 }
 
-#[derive(Debug)]
+// DateTimeMeta serialization
+#[derive(Serialize, Deserialize)]
 pub struct DateTimeMeta {
+    #[serde(with = "chrono::serde::ts_milliseconds")]
     pub created_at: DateTime<Utc>,
+    #[serde(with = "chrono::serde::ts_milliseconds_option")]
     pub expire_at: Option<DateTime<Utc>>,
 }
 
 pub struct DateTimeMetaBuilder {
     created_at: DateTime<Utc>,
     expire_at: Option<DateTime<Utc>>,
+}
+
+// Implement conversion to/from DateTimeMetaBuilder
+impl From<DateTimeMetaBuilder> for DateTimeMeta {
+    fn from(builder: DateTimeMetaBuilder) -> Self {
+        builder.build()
+    }
 }
 
 impl DateTimeMetaBuilder {
@@ -144,5 +210,57 @@ impl DateTimeMetaBuilder {
             created_at: self.created_at,
             expire_at: self.expire_at,
         }
+    }
+}
+
+
+// Custom serialization/deserialization for DashSet
+mod serde_dashset {
+    use super::*;
+    use serde::{ser::SerializeSeq, Deserializer, Serializer};
+
+    pub fn serialize<S>(set: &DashSet<String>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut seq = serializer.serialize_seq(Some(set.len()))?;
+        for item in set.iter() {
+            seq.serialize_element(item.key())?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<DashSet<String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let vec = Vec::<String>::deserialize(deserializer)?;
+        Ok(DashSet::from_iter(vec))
+    }
+}
+
+// Custom serialization/deserialization for DashMap
+mod serde_dashmap {
+    use super::*;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::collections::HashMap;
+
+    pub fn serialize<S>(map: &DashMap<String, String>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut hm = HashMap::new();
+        for entry in map.iter() {
+            hm.insert(entry.key().clone(), entry.value().clone());
+        }
+        hm.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<DashMap<String, String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let hm = HashMap::<String, String>::deserialize(deserializer)?;
+        Ok(DashMap::from_iter(hm))
     }
 }
