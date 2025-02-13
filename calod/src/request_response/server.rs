@@ -1,36 +1,79 @@
-use std::sync::Arc;
+
+use std::io::{Error, ErrorKind};
+use std::net::SocketAddr;
+use std::sync::{Arc, Weak};
 
 use bytes::{Buf, BytesMut};
+use dashmap::DashMap;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::parser::parser::{RESPParser, RespError, Value};
 
 use super::command::Command;
 use super::served_store::ServedCalodStore;
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, error, info, instrument, trace};
 
+type ClientId = Uuid;
 
+#[derive(Clone)]
 pub struct Connection {
     store: Arc<ServedCalodStore>,
     buffer: BytesMut,
+    client_id: ClientId,
+    connection_name: Arc<Mutex<Option<String>>>,
+    peer_addr: Option<std::net::SocketAddr>,
 }
 
 impl Connection {
     const INITIAL_BUFFER_SIZE: usize = 4096;
-    // const MAX_BUFFER_SIZE: usize = 16_384;
 
     pub fn new(store: Arc<ServedCalodStore>) -> Self {
         Self {
             store,
-            buffer: BytesMut::with_capacity(Self::INITIAL_BUFFER_SIZE)
+            buffer: BytesMut::with_capacity(Self::INITIAL_BUFFER_SIZE),
+            client_id: Uuid::nil(),
+            connection_name: Arc::new(Mutex::new(None)),
+            peer_addr: None
         }
     }
 
-    #[instrument(level = "debug", skip(self, stream), fields(client_addr = %stream.peer_addr().unwrap()))]
-    pub async fn process(&mut self, mut stream: TcpStream) {
-        let client_addr = stream.peer_addr().unwrap();
-        info!("Processing connection from {}", client_addr);
+    pub fn get_peer_address(&self) -> Result<SocketAddr, Error> {
+       self.peer_addr.ok_or_else(|| Error::new(ErrorKind::AddrNotAvailable, "Peer address not available."))
+    }
+
+    pub fn set_client_id(&mut self, client_id: ClientId) {
+        self.client_id = client_id;
+    }
+
+    pub fn get_client_id(&self) -> ClientId {
+        self.client_id
+    }
+
+    pub async fn get_client_name(&self) -> Option<String> {
+        let lock = self.connection_name.lock().await;
+        lock.clone()
+    }
+
+    pub async fn set_client_name(&self, name: String) {
+        let mut lock = self.connection_name.lock().await;
+        *lock = Some(name);
+    }
+
+    #[instrument(level = "debug", skip(self, stream, active_connections), fields(client_addr = %stream.peer_addr().unwrap(), client_id = %self.client_id))]
+    pub async fn process(&mut self, mut stream: TcpStream, active_connections: Arc<DashMap<ClientId, Weak<Mutex<Connection>>>>) {
+        let client_addr = match stream.peer_addr() {
+            Ok(addr) => addr,
+            Err(e) => {
+                error!("Failed to get peer address: {}", e);
+                return;
+            }
+        };
+        
+        info!("Processing connection from {} with client ID {}", client_addr, self.client_id);
+        let current_connection_arc_clone = Arc::new(Mutex::new(self.clone()));
 
         loop {
             self.buffer.reserve(Self::INITIAL_BUFFER_SIZE);
@@ -41,12 +84,12 @@ impl Connection {
                     break;
                 },
                 Ok(bytes_read) => {
-                    debug!("Read {} bytes from client {}", bytes_read, client_addr);
-                    debug!("Current buffer content: {:?}", String::from_utf8_lossy(&self.buffer));
+                    debug!("Read {} bytes from client {}: {:?}", bytes_read, client_addr, String::from_utf8_lossy(&self.buffer));
+                    trace!("Raw command received from client {}: {:?}", client_addr, String::from_utf8_lossy(&self.buffer));
 
                     while let Some((command, consumed)) = self.parse_command() {
                         debug!("Parsed command from client {}: {:?}", client_addr, command);
-                        let response = self.store.execute(command).await;
+                        let response = self.store.execute(command, active_connections.clone(), current_connection_arc_clone.clone()).await;
                         debug!("Response for client {} is ready", client_addr);
                         if let Err(e) = stream.write_all(&response).await {
                             error!("Write error to client {}: {}", client_addr, e);
@@ -66,7 +109,7 @@ impl Connection {
         if let Err(e) = stream.shutdown().await {
             error!("Error shutting down connection from {}: {}", client_addr, e);
         }
-        info!("Connection with {} closed.", client_addr);
+        info!("Connection with {} and client ID {} closed.", client_addr, self.client_id);
     }
 
     fn parse_command(&self) -> Option<(Command, usize)> {
@@ -81,7 +124,7 @@ impl Connection {
                         Value::Array(ref array_values) => array_values.as_slice(),
                         _ => std::slice::from_ref(&resp)
                     };
-
+                    debug!("Parsed RESP value: {:?}", resp);
                     match Command::try_from(command_values) {
                         Ok(cmd) => {
                             commands.push((cmd, consumed));
