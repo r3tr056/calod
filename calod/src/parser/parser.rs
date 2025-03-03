@@ -1,6 +1,15 @@
+
 use memchr::memchr2;
 use thiserror::Error;
 use tracing::{debug, error, trace};
+
+// use std::simd::{LaneCount, Simd, StdFloat};
+
+// #[cfg(target_arch = "x86_64")]
+// type TargetSimd<const N: usize> = Simd<u8, N>;
+
+// #[cfg(not(target_arch = "x86_64"))] // Fallback for non-x86_64 architectures
+// type TargetSimd<const N: usize> = Simd<u8, N>;
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Value {
@@ -60,7 +69,7 @@ impl RESPParser {
     }
 
     // #[inline(always)]
-    // fn find_crlf_simd(buf: &[u8]) -> Option<usize> {
+    // fn find_crlf_simd(buf: &[u8]) -> Option<usize> where LaneCount<N>: StdLaneCount {
     //     const SIMD_WIDTH: usize = 32;
         
     //     let mut offset = 0;
@@ -216,6 +225,8 @@ impl RESPParser {
                 b'+' => Self::parse_simd_string(&buf[position..])?,
                 b'$' => Self::parse_simd_bulk(&buf[position..])?,
                 b'*' => Self::parse_simd_array(&buf[position..])?,
+                b'-' => Self::parse_simd_error(&buf[position..])?,
+                b':' => Self::parse_simd_integer(&buf[position..])?,
                 _ => {
                     error!("parse_simd_array: Invalid format - unexpected array element type start byte: {}", buf[position]);
                     return Err(RespError::InvalidFormat)
