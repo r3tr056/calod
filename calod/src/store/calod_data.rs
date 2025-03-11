@@ -1,15 +1,16 @@
+use core::f64;
+use std::sync::Arc;
 use atomic_refcell::AtomicRefCell;
 use chrono::{DateTime, Utc, Duration as ChronoDuration};
 use dashmap::{DashMap, DashSet};
+
 use serde_with::serde_as;
-use core::f64;
-use std::sync::Arc;
 use serde::{Serialize, Deserialize};
 use serde_json::Value as JsonValue;
 
-use super::graph::graph_data::GraphData;
+use crate::extensions::fastgraphdb::base::GraphData;
 
-// CacheEntry struct
+/// CacheEntry struct
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheEntry {
@@ -27,7 +28,7 @@ impl CacheEntry {
         let created_at = Utc::now();
         let expires_at = ttl.map(|duration| created_at + duration);
 
-        Self { value, expires_at, created_at }
+        Self { value, expires_at, created_at}
     }
 
     pub fn size(&self) -> usize {
@@ -217,7 +218,7 @@ impl Hash {
     }
 }
 
-// DateTimeMeta serialization
+/// DateTimeMeta serialization
 #[derive(Serialize, Deserialize)]
 pub struct DateTimeMeta {
     #[serde(with = "chrono::serde::ts_milliseconds")]
@@ -231,7 +232,7 @@ pub struct DateTimeMetaBuilder {
     expire_at: Option<DateTime<Utc>>,
 }
 
-// Implement conversion to/from DateTimeMetaBuilder
+/// Implement conversion to/from DateTimeMetaBuilder
 impl From<DateTimeMetaBuilder> for DateTimeMeta {
     fn from(builder: DateTimeMetaBuilder) -> Self {
         builder.build()
@@ -260,7 +261,7 @@ impl DateTimeMetaBuilder {
 }
 
 
-// Custom serialization/deserialization for DashSet
+/// Custom serialization/deserialization for DashSet
 mod serde_dashset {
     use super::*;
     use serde::{ser::SerializeSeq, Deserializer, Serializer};
@@ -285,7 +286,7 @@ mod serde_dashset {
     }
 }
 
-// Custom serialization/deserialization for DashMap
+/// Custom serialization/deserialization for DashMap
 mod serde_dashmap {
     use super::*;
     use serde::{Deserialize, Deserializer, Serializer};
