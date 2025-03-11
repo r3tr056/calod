@@ -1,7 +1,7 @@
 use serde_json::{Value as JsonValue, json, Number as JsonNumber, Map as JsonMap};
 use std::cmp;
 
-use crate::store::calod_store::CacheError;
+use crate::store::error::CacheError;
 
 
 pub fn json_type_to_string(json_value: &JsonValue) -> String {
@@ -233,7 +233,7 @@ pub fn jsonpath_del(doc: &mut JsonValue, path: &str) -> Result<usize, CacheError
             if let JsonValue::Object(map) = parent {
                 Ok(map.remove(&key).map(|_| 1).unwrap_or(0))
             } else {
-                Err(CacheError::DataTypeMismatch(key, "object".to_string(), json_type_to_string(parent)))
+                Err(CacheError::DataTypeMismatch(key, "object".to_string(), json_type_to_string(&parent)))
             }
         },
         PathSegment::Index(idx) => {
@@ -245,7 +245,7 @@ pub fn jsonpath_del(doc: &mut JsonValue, path: &str) -> Result<usize, CacheError
                     Ok(0)
                 }
             } else {
-                Err(CacheError::DataTypeMismatch(idx.to_string(), "array".to_string(), json_type_to_string(parent)))
+                Err(CacheError::DataTypeMismatch(idx.to_string(), "array".to_string(), json_type_to_string(&parent)))
             }
         },
     }
