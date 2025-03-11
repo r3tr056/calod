@@ -1,719 +1,234 @@
 use chrono::Duration as ChronoDuration;
 use dashmap::DashMap;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::broadcast;
 use tokio::time::timeout;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{Ordering, AtomicUsize};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use thiserror::Error;
-use ahash::AHasher;
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tracing::{error, trace};
 use serde_json::{json, Error as SerdeJsonError, Value as JsonValue};
 
 use bincode::{serialize, deserialize};
 use tokio::fs::{read, write};
-use crate::request_response::command::{InsertOption, SetExpireOption, SetOption};
-use crate::store::calod_data::{CacheEntry, EvictionCandidate};
+use crate::cld_srv::command::{InsertOption, SetExpireOption, SetOption};
+use crate::store::calod_data::CacheEntry;
+use crate::extensions::fastgraphdb::base::{Edge, GraphData, Node};
 
 use super::calod_data::DataType;
-use super::config::CacheConfig;
-use super::graph::graph_data::{Edge, GraphData, Node};
+use super::error::{CacheError, PersistenceError};
 use super::helpers::json_helpers::{json_type_to_string, jsonpath_arrappend, jsonpath_arrindex, jsonpath_arrinsert, jsonpath_arrlen, jsonpath_arrpop, jsonpath_arrtrim, jsonpath_del, jsonpath_get, jsonpath_numincrby, jsonpath_objkeys, jsonpath_objlen, jsonpath_objset, jsonpath_set, jsonpath_strappend};
 use super::metrics::CalodMetrics;
 
-
-
-#[derive(Debug, Error, Clone)]
-pub enum CacheError {
-    #[error("Key `{0}` not found")]
-    KeyNotFound(String),
-    #[error("Key `{0}` has expired")]
-    KeyExpired(String),
-    #[error("Invalid command arguments: {0}")]
-    InvalidCommandArguments(String),
-    #[error("Command not implemented: {0}")]
-    CommandNotImplemented(String),
-    #[error("Internal cache error: {0}")]
-    InternalError(String),
-    #[error("Data type mismatch for key `{0}`. Expected `{1}`, found `{2}`")]
-    DataTypeMismatch(String, String, String),
-    #[error("Field `{0}` not found in hash for key `{1}`")]
-    FieldNotFound(String, String),
-    #[error("Mutatuon `{0}` not supported")]
-    MutationNotSupported(String),
-    #[error("Invalid score format")]
-    InvalidScoreFormat,
-    #[error("Index out of range")]
-    IndexOutOfRange,
-    #[error("Value is not an integer")]
-    NotAnInteger,
-}
-
-
-#[derive(Debug)]
-pub enum PersistenceError {
-    IoError(std::io::Error),
-    SerializationError(bincode::Error),
-}
-
-type ShardIndex = usize;
-
-pub struct ShardedStore {
-    shards: Vec<Arc<CalodShard>>,
-    metrics: Arc<CalodMetrics>,
-    config: CacheConfig
-}
-
-#[async_trait::async_trait]
-pub trait CachePersistence {
-    async fn save(&self, path: &str) -> Result<(), PersistenceError>;
-    async fn load(&self, path: &str) -> Result<(), PersistenceError>;
-}
-
-impl ShardedStore {
-    pub fn new(config: CacheConfig) -> Self {
-        let metrics = Arc::new(CalodMetrics::default());
-        let per_shard_cap = (config.capacity + config.shards - 1) / config.shards;
-
-        let shards = (0..config.shards).map(|_| Arc::new(CalodShard::new(per_shard_cap, metrics.clone()))).collect();
-
-        Self {
-            shards,
-            config,
-            metrics
-        }
-    }
-
-    #[inline]
-    fn get_shard_index<K: Hash + ?Sized>(&self, key: &K) -> ShardIndex where K:AsRef<[u8]> {
-        let mut hasher = AHasher::default();
-        key.hash(&mut hasher);
-        (hasher.finish() % self.shards.len() as u64) as usize
-    }
-
-    pub async fn ping(&self) -> String {
-        "+PONG\r\n".to_string()
-    }
-
-    pub async fn info(&self, _section: Option<&str>) -> String {
-        let metrics_report = self.metrics.report();
-        format!("{}\r\n", metrics_report)
-    }
-
-    // generic commands
-    pub async fn type_cmd(&self, key: &str) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].type_cmd(key).await
-    }
-
-    pub async fn keys(&self, pattern: &str) -> Vec<String> {
-        let mut all_keys = Vec::new();
-        for shard in &self.shards {
-            all_keys.extend(shard.keys(pattern).await);
-        }
-        all_keys
-    }
-
-    pub async fn exists(&self, key: &str) -> bool {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].exists(key).await
-    }
-
-    pub async fn expire(&self, key: &str, seconds: u64) -> Result<bool, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].exipre(key, seconds).await
-    }
-
-    pub async fn ttl(&self, key: &str) -> Result<Option<i64>, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].ttl(key).await
-    }
-
-    pub async fn persist(&self, key: &str) -> Result<bool, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].persist(key).await
-    }
-
-    pub async fn delete(&self, key: &str) -> bool {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].delete(key).await
-    }
-
-    pub async fn keys_cmd(&self, pattern: &str) -> Result<DataType, CacheError> {
-        let keys = self.keys(pattern).await;
-        let list_data: Vec<String> = keys.into_iter().collect();
-        Ok(DataType::List(list_data.into()))
-    }
-
-    pub async fn exists_cmd(&self, key: &str) -> Result<DataType, CacheError> {
-        let exists = self.exists(key).await;
-        Ok(DataType::Integer(if exists { 1 } else { 0 }))
-    }
-
-    pub async fn expire_cmd(&self, key: &str, seconds: u64) -> Result<DataType, CacheError> {
-        let expired = self.expire(key, seconds).await?;
-        Ok(DataType::Integer(if expired { 1 } else { 0 }))
-    }
-
-    pub async fn ttl_cmd(&self, key: &str) -> Result<DataType, CacheError> {
-        let ttl_result = self.ttl(key).await?;
-        Ok(DataType::Integer(ttl_result.unwrap_or(-2)))
-    }
-
-    pub async fn persist_cmd(&self, key: &str) -> Result<DataType, CacheError> {
-        let persisted = self.persist(key).await?;
-        Ok(DataType::Integer(if persisted { 1 } else { 0 }))
-    }
-
-    pub async fn del_cmd(&self, key: &str) -> Result<DataType, CacheError> {
-        let deleted_count = if self.delete(key).await { 1 } else { 0 };
-        Ok(DataType::Integer(deleted_count))
-    }
-
-    // strings/numbers commands
-
-    pub async fn get_cmd(&self, key: &str) -> Result<DataType, CacheError> {
-        let result = self.get(key).await;
-        match result {
-            Ok(DataType::String(_)) | Ok(DataType::Nil) => result, // Only return Strings or Nil for GET
-            Ok(other_type) => Err(CacheError::DataTypeMismatch(key.to_string(), "string".to_string(), other_type.data_type())),
-            Err(e) => Err(e)
-        }
-    }
-
-    pub async fn get(&self, key: &str) -> Result<DataType, CacheError> {
-        let start = Instant::now();
-        let shard_idx = self.get_shard_index(key);
-        let result = self.shards[shard_idx].get(key).await;
-
-        if self.config.metrics_enabled {
-            let latency = start.elapsed();
-            self.metrics.record_read(latency);
-
-            match &result {
-                Ok(_) => self.metrics.record_hit(),
-                Err(CacheError::KeyNotFound(_)) => self.metrics.record_miss(),
-                _ => (),
-            }
-        }
-
-        result
-    }
-
-    pub async fn set_cmd(&self, key: String, value: String, expire_option: Option<SetExpireOption>, set_option: Option<SetOption>) -> Result<(), CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].set_cmd(key, DataType::String(value), expire_option, set_option).await
-    }
-
-    pub async fn append_cmd(&self, key: &str, value: String) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].append_cmd(key, value).await
-    }
-
-    pub async fn strlen_cmd(&self, key: &str) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].strlen_cmd(key).await
-    }
-
-    pub async fn getrange_cmd(&self, key: &str, start: isize, end: isize) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].getrange_cmd(key, start, end).await
-    }
-
-    pub async fn setrange_cmd(&self, key: &str, offset: usize, value: String) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].setrange_cmd(key, offset, value).await
-    }
-
-    pub async fn getset_cmd(&self, key: &str, value: String) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].getset_cmd(key, value).await
-    }
-
-    pub async fn mget_cmd(&self, keys: &Vec<String>) -> Result<DataType, CacheError> {
-        let mut results = Vec::with_capacity(keys.len());
-        for key in keys {
-            let shard_idx = self.get_shard_index(key);
-            results.push(self.shards[shard_idx].get(key).await);
-        }
-
-        let resp_list = results.into_iter().map(|res| match res {
-            Ok(DataType::String(s)) => s,
-            Ok(DataType::Nil) | Err(CacheError::KeyNotFound(_)) => "".to_string(),
-            Err(e) => {
-                error!("Error during MGET: {:?}", e);
-                format!("Error during MGET: {:?}", e)
-            }
-            Ok(other) => {
-                error!("Unexpected DataType in MGET: {:?}", other);
-                format!("Unexpected DataType in MGET: {:?}", other)
-            }
-        }).collect::<Vec<String>>();
-
-        Ok(DataType::List(resp_list))
-    }
-
-    pub async fn mset_cmd(&self, key_values: Vec<(String, String)>) -> Result<(), CacheError> {
-        for (key, value) in key_values {
-            let shard_idx = self.get_shard_index(&key);
-            self.shards[shard_idx].set_cmd(key, DataType::String(value), None, None).await?; // No expiry/option for MSET in this example
-        }
-        Ok(())
-    }
-
-    pub async fn incr_cmd(&self, key: &str) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].incr_cmd(key).await
-    }
-
-    pub async fn decr_cmd(&self, key: &str) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].decr_cmd(key).await
-    }
-
-    pub async fn incrby_cmd(&self, key: &str, increment: i64) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].incrby_cmd(key, increment).await
-    }
-
-    pub async fn decrby_cmd(&self, key: &str, decrement: i64) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].decrby_cmd(key, decrement).await
-    }
-
-    pub async fn incrbyfloat_cmd(&self, key: &str, increment: f64) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].incrbyfloat_cmd(key, increment).await
-    }
-
-    // Hash Commands
-    pub async fn hset_cmd(&self, key: &str, field_values: Vec<(String, String)>) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].hset_cmd(key, field_values).await
-    }
-    pub async fn hget_cmd(&self, key: &str, field: String) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].hget_cmd(key, field).await
-    }
-
-    pub async fn hdel_cmd(&self, key: &str, fields: Vec<String>) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].hdel_cmd(key, fields).await
-    }
-
-    pub async fn hexists_cmd(&self, key: &str, field: String) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].hexists_cmd(key, field).await
-    }
-
-    pub async fn hgetall_cmd(&self, key: &str) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].hgetall_cmd(key).await
-    }
-
-    pub async fn hincrby_cmd(&self, key: &str, field: String, increment: i64) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].hincrby_cmd(key, field, increment).await
-    }
-
-    pub async fn hincrbyfloat_cmd(&self, key: &str, key_field_increment: Vec<(String, f64)>) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].hincrbyfloat_cmd(key, key_field_increment).await
-    }
-
-    pub async fn hkeys_cmd(&self, key: &str) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].hkeys_cmd(key).await
-    }
-
-    pub async fn hlen_cmd(&self, key: &str) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].hlen_cmd(key).await
-    }
-
-    pub async fn hmget_cmd(&self, key: &str, fields: Vec<String>) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].hmget_cmd(key, fields).await
-    }
-
-    pub async fn hmset_cmd(&self, key: &str, field_values: Vec<(String, String)>) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].hmset_cmd(key, field_values).await
-    }
-
-    pub async fn hsetnx_cmd(&self, key: &str, field: String, value: String) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].hsetnx_cmd(key, field, value).await
-    }
-
-    pub async fn hvals_cmd(&self, key: &str) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].hvals_cmd(key).await
-    }
-
-    // List Commands
-    pub async fn lpush_cmd(&self, key: String, values: Vec<String>) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].lpush_cmd(key, values).await
-    }
-
-    pub async fn rpush_cmd(&self, key: String, values: Vec<String>) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].rpush_cmd(key, values).await
-    }
-
-    pub async fn lpop_cmd(&self, key: &str) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].lpop_cmd(key).await
-    }
-
-    pub async fn rpop_cmd(&self, key: &str) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].rpop_cmd(key).await
-    }
-
-    pub async fn llen_cmd(&self, key: &str) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].llen_cmd(key).await
-    }
-
-    pub async fn lrange_cmd(&self, key: &str, start: isize, end: isize) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].lrange_cmd(key, start, end).await
-    }
-
-    pub async fn lindex_cmd(&self, key: &str, index: isize) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].lindex_cmd(key, index).await
-    }
-
-    pub async fn linsert_cmd(&self, key: &str, before_after: InsertOption, pivot: String, value: String) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].linsert_cmd(key, before_after, pivot, value).await
-    }
-
-    pub async fn lset_cmd(&self, key: &str, index: isize, value: String) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].lset_cmd(key, index, value).await
-    }
-
-    pub async fn ltrim_cmd(&self, key: &str, start: isize, end: isize) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].ltrim_cmd(key, start, end).await
-    }
-
-    pub async fn lrem_cmd(&self, key: &str, count: i64, value: String) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(key);
-        self.shards[shard_idx].lrem_cmd(key, count, value).await
-    }
-
-    pub async fn rpoplpush_cmd(&self, source: &str, destination: &str) -> Result<DataType, CacheError> {
-        let source_shard_idx = self.get_shard_index(source);
-        let dest_shard_idx = self.get_shard_index(destination);
-
-        // For RPOPLPUSH, we need to access two shards. To avoid deadlock, we can acquire locks in a consistent order
-        let (source_shard, _dest_shard) = if source_shard_idx < dest_shard_idx {
-            (&self.shards[source_shard_idx], &self.shards[dest_shard_idx])
-        } else if source_shard_idx > dest_shard_idx {
-            (&self.shards[dest_shard_idx], &self.shards[source_shard_idx])
-        } else { // Same shard, no need for special ordering
-            (&self.shards[source_shard_idx], &self.shards[dest_shard_idx])
-        };
-
-        // Note: Directly calling shard methods here, as RPOPLPUSH logic itself needs to handle cross-shard operations if needed.
-        source_shard.rpoplpush_cmd(source, destination).await
-    }
-
-    pub async fn blpop_cmd(&self, keys: Vec<String>, timeout: f64) -> Result<DataType, CacheError> {
-        // BLPOP/BRPOP can operate on multiple keys, but within the same shard in this implementation.
-        // Choose the shard based on the first key for simplicity.  Redis allows BLPOP/BRPOP across multiple keys in different DBs, but here we assume keys are within the same DB (shard group).
-        if let Some(first_key) = keys.first() {
-            let shard_idx = self.get_shard_index(first_key);
-            self.shards[shard_idx].blpop_cmd(keys, timeout).await
-        } else {
-            Ok(DataType::Nil) // No keys provided, return Nil immediately
-        }
-    }
-
-    pub async fn brpop_cmd(&self, keys: Vec<String>, timeout: f64) -> Result<DataType, CacheError> {
-         if let Some(first_key) = keys.first() {
-            let shard_idx = self.get_shard_index(first_key);
-            self.shards[shard_idx].brpop_cmd(keys, timeout).await
-        } else {
-            Ok(DataType::Nil) // No keys provided, return Nil immediately
-        }
-    }
-
-    // --- JSON Commands ---
-    pub async fn json_set_cmd(&self, key: String, path: String, value: String) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].json_set_cmd(key, path, value).await
-    }
-
-    pub async fn json_get_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].json_get_cmd(key, path).await
-    }
-
-    pub async fn json_del_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].json_del_cmd(key, path).await
-    }
-
-    pub async fn json_type_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].json_type_cmd(key, path).await
-    }
-
-    pub async fn json_numincrby_cmd(&self, key: String, path: String, increment: f64) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].json_numincrby_cmd(key, path, increment).await
-    }
-
-    pub async fn json_strappend_cmd(&self, key: String, path: String, value: String) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].json_strappend_cmd(key, path, value).await
-    }
-
-    pub async fn json_arrappend_cmd(&self, key: String, path: String, values: Vec<String>) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].json_arrappend_cmd(key, path, values).await
-    }
-
-    pub async fn json_objset_cmd(&self, key: String, path: String, key_to_set: String, value: String) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].json_objset_cmd(key, path, key_to_set, value).await
-    }
-
-    pub async fn json_objkeys_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].json_objkeys_cmd(key, path).await
-    }
-
-    pub async fn json_objlen_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].json_objlen_cmd(key, path).await
-    }
-
-    pub async fn json_arrindex_cmd(&self, key: String, path: String, value: String, range: Option<(isize, isize)>) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].json_arrindex_cmd(key, path, value, range).await
-    }
-
-    pub async fn json_arrinsert_cmd(&self, key: String, path: String, index: isize, values: Vec<String>) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].json_arrinsert_cmd(key, path, index, values).await
-    }
-
-    pub async fn json_arrlen_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].json_arrlen_cmd(key, path).await
-    }
-
-    pub async fn json_arrpop_cmd(&self, key: String, path: String, index: Option<isize>) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].json_arrpop_cmd(key, path, index).await
-    }
-
-    pub async fn json_arrtrim_cmd(&self, key: String, path: String, start: isize, stop: isize) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].json_arrtrim_cmd(key, path, start, stop).await
-    }
-
-    // --- Graph Commands ---
-    pub async fn graph_create_node_cmd(&self, key: String, node_id: String, properties: Vec<(String, String)>) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].graph_create_node_cmd(key, node_id, properties).await
-    }
-
-    pub async fn graph_get_node_cmd(&self, key: String, node_id: String) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].graph_get_node_cmd(key, node_id).await
-    }
-
-    pub async fn graph_delete_node_cmd(&self, key: String, node_id: String) -> Result<DataType, CacheError> {
-        let shard_idx = self.get_shard_index(&key);
-        self.shards[shard_idx].graph_delete_node_cmd(key, node_id).await
-    }
-
-    pub fn metrics(&self) -> String {
-        self.metrics.report()
-    }
-}
-
-#[async_trait::async_trait]
-impl CachePersistence for ShardedStore {
-    async fn save(&self, path: &str) -> Result<(), PersistenceError> {
-        let mut handles = Vec::new();
-
-        for (i, shard) in self.shards.iter().enumerate() {
-            let shard = Arc::clone(shard);
-            let path = format!("{}/shard_{}.bin", path, i);
-            handles.push(tokio::spawn(async move {
-                shard.save(&path).await
-            }));
-        }
-
-        for handle in handles {
-            handle.await.map_err(|e| PersistenceError::IoError(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Join error: {}", e)
-            )))??;
-        }
-
-        Ok(())
-    }
-    
-    async fn load(&self, path: &str) -> Result<(), PersistenceError> {
-        for (i, shard) in self.shards.iter().enumerate() {
-            let path = format!("{}/shard_{}.bin", path, i);
-            shard.load(&path).await?;
-        }
-        Ok(())
-    }
-}
-
-struct CalodShard {
-    data: DashMap<String, CacheEntry>,
-    lru: Mutex<VecDeque<String>>,
+static OK_RESPONSE: &str = "OK";
+static NONE_TYPE: &str = "none";
+
+
+/// Individual shard in the Calod Store
+pub struct CalodShard {
+    /// Main data storage
+    data: DashMap<String, CacheEntry, ahash::RandomState>,
+    /// LRU tracking - Using segmented LRU to reduce lock contention
+    lru_segments: Vec<RwLock<VecDeque<String>>>,
+    /// Shard capacity
     capacity: AtomicUsize,
+    /// Current size
     size: AtomicUsize,
+    /// Metrics
     metrics: Arc<CalodMetrics>,
+    /// List modification notifier for PubSub
     list_modification_notifier: broadcast::Sender<String>,
+    /// Shard ID
+    id: usize,
+    /// Number of LRU segments for reducing contention
+    lru_segments_count: usize,
 }
 
 impl CalodShard {
-    fn new(capacity: usize, metrics: Arc<CalodMetrics>) -> Self {
+    pub fn new(capacity: usize, metrics: Arc<CalodMetrics>, id: usize) -> Self {
+        let lru_segments_count = std::cmp::max(
+            std::thread::available_parallelism().map(|p| p.get() * 2).unwrap_or(8), 8);
+
+        let mut lru_segments = Vec::with_capacity(lru_segments_count);
+        for _ in 0..lru_segments_count {
+            lru_segments.push(RwLock::new(VecDeque::new()));
+        }
+
+        let data = DashMap::with_hasher(ahash::RandomState::new());
+
         Self {
-            data: DashMap::new(),
-            lru: Mutex::new(VecDeque::new()),
+            data,
+            lru_segments,
             capacity: AtomicUsize::new(capacity),
             size: AtomicUsize::new(0),
-            list_modification_notifier: broadcast::channel(32).0,
+            list_modification_notifier: broadcast::channel(1024).0,
             metrics,
+            id,
+            lru_segments_count
         }
+    }
+
+    /// Get the shard ID
+    pub fn id(&self) -> usize { self.id }
+
+    #[inline]
+    fn get_lru_segment(&self, key: &str) -> usize {
+        let mut hasher = ahash::AHasher::default();
+        key.hash(&mut hasher);
+        let hash = hasher.finish();
+        (hash as usize) % self.lru_segments_count
     }
 
     // Command: TYPE, Returns the datatype
     pub async fn type_cmd(&self, key: &str) -> Result<DataType, CacheError> {
-        match self.data.get(key) {
-            Some(entry_ref) => {
-                let entry = entry_ref.value();
-                if entry.is_expired() {
-                    drop(entry_ref);
-                    self.data.remove(key);
-                    self.size.fetch_sub(1, Ordering::Relaxed);
-                    self.remove_from_lru(key).await;
-                    return Ok(DataType::Nil);
-                }
-                Ok(DataType::String(entry.value.data_type()))
-            },
-            None => Ok(DataType::String("none".to_string()))
-        }
-    }
-
-    // Command: KEYS, Returns the keys in the store matching a regex pattern string
-    async fn keys(&self, pattern: &str) -> Vec<String> {
-        trace!("Shard getting keys with pattern: {}", pattern);
-        self.data.iter().filter_map(|entry| {
-            if entry.key().contains(pattern) && !entry.value().is_expired() {
-                Some(entry.key().clone())
-            } else {
-                None
-            }
-        }).collect()
-    }
-
-    // Command: EXISTS, Returns whether a key exists in the datastore
-    async fn exists(&self, key: &str) -> bool {
-        trace!("Shard checking exists for key: {}", key);
         if let Some(entry_ref) = self.data.get(key) {
-            if !entry_ref.is_expired() {
-                return true;
-            } else {
+            let entry = entry_ref.value();
+            if entry.is_expired() {
                 drop(entry_ref);
                 self.data.remove(key);
                 self.size.fetch_sub(1, Ordering::Relaxed);
                 self.remove_from_lru(key).await;
-                return false;
+                return Ok(DataType::Nil);
             }
+            self.touch_key(key).await;
+            Ok(DataType::String(entry.value.data_type()))
+        } else {
+            Ok(DataType::String(NONE_TYPE.to_string()))
         }
-        false
     }
 
-    // Command: EXPIRE, Expires a key with a set timeout
-    async fn exipre(&self, key: &str, seconds: u64) -> Result<bool, CacheError> {
-        let mut entry_writer = self.data.get_mut(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
-        entry_writer.value_mut().expire_in(Duration::from_secs(seconds));
-        Ok(true)
+    // Command: KEYS, Returns the keys in the store matching a regex pattern string
+    pub async fn keys(&self, pattern: &str) -> Vec<String> {
+        trace!("Shard getting keys with pattern: {}", pattern);
+
+        let estimated_size = (self.size.load(Ordering::Relaxed) / 10).max(16);
+        let mut results = Vec::with_capacity(estimated_size);
+
+        self.data.iter().for_each(|entry| {
+            if entry.key().contains(pattern) && !entry.value().is_expired() {
+                results.push(entry.key().clone());
+            }
+        });
+
+        results
     }
 
-    // Command: TTL
-    async fn ttl(&self, key: &str) -> Result<Option<i64>, CacheError> {
-        let entry_ref = self.data.get(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
-        let entry = entry_ref.value();
-        if entry.is_expired() {
-            drop(entry_ref);        // Drop read guard before deletion
-            self.data.remove(key);
-            self.size.fetch_sub(1, Ordering::Relaxed);
-            self.remove_from_lru(key).await;
-            return Err(CacheError::KeyExpired(key.to_string()));
-        }
-
-        Ok(entry.ttl().map(|expiry| {
-            expiry.num_seconds()
-        }))
-    }
-
-    // Command : PERSIST
-    async fn persist(&self, key: &str) -> Result<bool, CacheError> {
-        let mut entry_writer = self.data.get_mut(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
-        entry_writer.value_mut().persist();
-        Ok(true)
-    }
-
-    // Command : DEL
-    async fn delete(&self, key: &str) -> bool {
-        trace!("Shard deleting key: {}", key);
-        if self.data.remove(key).is_some() {
-            self.size.fetch_sub(1, Ordering::Relaxed);
-            self.remove_from_lru(key).await;
-            true
+    // Command: EXISTS, Returns whether a key exists in the datastore
+    #[inline]
+    pub async fn exists(&self, key: &str) -> bool {
+        trace!("Shard checking exists for key: {}", key);
+        
+        if let Some(entry_ref) = self.data.get(key) {
+            let result = !entry_ref.is_expired();
+            if !result {
+                drop(entry_ref);
+                self.data.remove(key);
+                self.size.fetch_sub(1, Ordering::Relaxed);
+                self.remove_from_lru(key).await;
+            } else {
+                self.touch_key(key).await;
+            }
+            result
         } else {
             false
         }
     }
 
+    // Command: EXPIRE, Expires a key with a set timeout
+    #[inline]
+    pub async fn expire(&self, key: &str, seconds: u64) -> Result<bool, CacheError> {
+        if let Some(mut entry_writer) = self.data.get_mut(key) {
+            entry_writer.value_mut().expire_in(Duration::from_secs(seconds));
+            self.touch_key(key).await;
+            Ok(true)
+        } else {
+            Err(CacheError::KeyNotFound(key.to_string()))
+        }
+    }
+
+    // Command: TTL
+    #[inline]
+    pub async fn ttl(&self, key: &str) -> Result<Option<i64>, CacheError> {
+        if let Some(entry_ref) = self.data.get(key) {
+            let entry = entry_ref.value();
+            if entry.is_expired() {
+                drop(entry_ref);        // Drop read guard before deletion
+                self.data.remove(key);
+                self.size.fetch_sub(1, Ordering::Relaxed);
+                self.remove_from_lru(key).await;
+                return Err(CacheError::KeyExpired(key.to_string()));
+            }
+
+            self.touch_key(key).await;
+            Ok(entry.ttl().map(|expiry| expiry.num_seconds()))
+        } else {
+            Err(CacheError::KeyNotFound(key.to_string()))
+        }
+    }
+
+    // Command : PERSIST
+    #[inline]
+    pub async fn persist(&self, key: &str) -> Result<bool, CacheError> {
+        if let Some(mut entry_writer) = self.data.get_mut(key) {
+            entry_writer.value_mut().persist();
+            self.touch_key(key).await;
+            Ok(true)
+        } else {
+            Err(CacheError::KeyNotFound(key.to_string()))
+        }
+    }
+
+    // Command : DEL
+    #[inline]
+    pub async fn delete(&self, key: &str) -> bool {
+        trace!("Shard deleting key: {}", key);
+        
+        let result = if let Some((_, entry)) = self.data.remove(key) {
+            self.size.fetch_sub(1, Ordering::Relaxed);
+            self.metrics.total_data_size.fetch_sub(entry.size() as u64, Ordering::Relaxed);
+            self.remove_from_lru(key).await;
+            true
+        } else {
+            false
+        };
+        
+        result
+    }
+
     // Strings/Numbers Commands
     // Command: GET
-    async fn get(&self, key: &str) -> Result<DataType, CacheError> {
+    #[inline]
+    pub async fn get(&self, key: &str) -> Result<DataType, CacheError> {
         trace!("Shard getting key: {}", key);
-        let entry_ref = self.data.get(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
-        let entry = entry_ref.value();
-        if entry.is_expired() {
-            drop(entry_ref);
-            self.data.remove(key);
-            self.size.fetch_sub(1, Ordering::Relaxed);
-            self.remove_from_lru(key).await;
-            return Err(CacheError::KeyExpired(key.to_string()));
-        }
+        if let Some(entry_ref) = self.data.get(key) {
+            let entry = entry_ref.value();
+            if entry.is_expired() {
+                drop(entry_ref);
+                self.data.remove(key);
+                self.size.fetch_sub(1, Ordering::Relaxed);
+                self.remove_from_lru(key).await;
+                return Err(CacheError::KeyExpired(key.to_string()));
+            }
 
-        self.touch_key(key).await;
-        Ok(entry.value.clone())
+            let result = entry.value.clone();
+            self.touch_key(key).await;
+            Ok(result)
+        } else {
+            Err(CacheError::KeyNotFound(key.to_string()))
+        }
     }
 
     // Command: SET
+    #[inline]
     pub async fn set_cmd(&self, key: String, value: DataType, expire_option: Option<SetExpireOption>, set_option: Option<SetOption>) -> Result<(), CacheError> {
-        let mut ttl_duration: Option<ChronoDuration> = None;
-        if let Some(expire) = expire_option {
-            match expire {
-                SetExpireOption::EX(seconds) => ttl_duration = Some(ChronoDuration::seconds(seconds as i64)),
-                SetExpireOption::PX(milliseconds) => ttl_duration = Some(ChronoDuration::milliseconds(milliseconds as i64)),
-            }
-        }
+        let ttl_duration: Option<ChronoDuration> = match expire_option {
+            Some(SetExpireOption::EX(seconds)) => Some(ChronoDuration::seconds(seconds as i64)),
+            Some(SetExpireOption::PX(milliseconds)) => Some(ChronoDuration::milliseconds(milliseconds as i64)),
+            None => None,
+        };
 
+        // Check NX/XX conditions first to avoid unnecessary work
         if let Some(option) = set_option {
             match option {
                 SetOption::NX => { if self.exists(&key).await { return Ok(()); } },
@@ -726,198 +241,278 @@ impl CalodShard {
     }
 
     // Command: SET
-    async fn set(&self, key: String, value: DataType, ttl: Option<ChronoDuration>) -> Option<DataType> {
+    #[inline]
+    pub async fn set(&self, key: String, value: DataType, ttl: Option<ChronoDuration>) -> Option<DataType> {
         trace!("Shard setting key: {}", key);
+        
+        // check if we need to evict before adding a new entry
         if self.size.load(Ordering::Relaxed) >= self.capacity.load(Ordering::Relaxed) {
             self.evict().await;
         }
+
         let entry = CacheEntry::new(value, ttl);
         let entry_size = entry.size();
-        let old_entry = self.data.insert(key.clone(), entry);
+        let old_entry = if let Some(old_e) = self.data.insert(key.clone(), entry) {
+            self.metrics.total_data_size.fetch_sub(old_e.size() as u64, Ordering::Relaxed);
+            Some(old_e.value)
+        } else {
+            self.size.fetch_add(1, Ordering::Relaxed);
+            None
+        };
 
-        self.touch_key(&key).await;
-        self.size.fetch_add(1, Ordering::Relaxed);
-
-        if let Some(old) = &old_entry {
-            self.metrics.total_data_size.fetch_sub(old.size() as u64, Ordering::Relaxed);
-        }
+        // update size metrics
         self.metrics.total_data_size.fetch_add(entry_size as u64, Ordering::Relaxed);
-
-        old_entry.map(|e| e.value)
+        self.touch_key(&key).await;
+        old_entry
     }
 
     // Command : APPEND
+    #[inline]
     pub async fn append_cmd(&self, key: &str, value: String) -> Result<DataType, CacheError> {
-        let mut entry_mut = self.data.entry(key.to_string()).or_insert_with(|| CacheEntry::new(DataType::String("".into()), None));
-        let entry = entry_mut.value_mut();
-
-        if let DataType::String(s) = &mut entry.value {
-            s.push_str(&value);
-            let new_len = s.len() as i64;
-            self.touch_key(key).await;
-            Ok(DataType::Integer(new_len))
-        } else {
-            Err(CacheError::DataTypeMismatch(key.to_string(), "String".to_string(), entry.value.data_type()))
+        // Fast path for common case - check if key exists and is string
+        if let Some(mut entry_writer) = self.data.get_mut(key) {
+            let entry = entry_writer.value_mut();
+            
+            // Handle string case
+            if let DataType::String(s) = &mut entry.value {
+                // Pre-allocate exact capacity needed to avoid reallocation
+                let old_len = s.len();
+                let new_len = old_len + value.len();
+                
+                if s.capacity() < new_len {
+                    s.reserve(new_len - old_len);
+                }
+                
+                s.push_str(&value);
+                self.touch_key(key).await;
+                return Ok(DataType::Integer(new_len as i64));
+            } else {
+                return Err(CacheError::DataTypeMismatch(
+                    key.to_string(), 
+                    "String".to_string(), 
+                    entry.value.data_type()
+                ));
+            }
         }
+        
+        // Key doesn't exist, create new entry
+        let new_len = value.len() as i64;
+        self.set(key.to_string(), DataType::String(value), None).await;
+        Ok(DataType::Integer(new_len))
     }
 
     // Command: STRLEN
+    #[inline]
     pub async fn strlen_cmd(&self, key: &str) -> Result<DataType, CacheError> {
-        match self.get(key).await {
-            Ok(DataType::String(s)) => Ok(DataType::Integer(s.len() as i64)),
-            Ok(DataType::Nil) => Ok(DataType::Integer(0)), // Key doesn't exist, STRLEN is 0
-            Ok(other_type) => Err(CacheError::DataTypeMismatch(key.to_string(), "string".to_string(), other_type.data_type())),
-            Err(e) => Err(e)
+        if let Some(entry_ref) = self.data.get(key) {
+            let entry = entry_ref.value();
+
+            if entry.is_expired() {
+                drop(entry_ref);
+                self.data.remove(key);
+                self.size.fetch_sub(1, Ordering::Relaxed);
+                self.remove_from_lru(key).await;
+                return Ok(DataType::Integer(0));
+            }
+
+            match &entry.value {
+                DataType::String(s) => {
+                    self.touch_key(key).await;
+                    Ok(DataType::Integer(s.len() as i64))
+                },
+                DataType::Nil => Ok(DataType::Integer(0)),
+                _ => Err(CacheError::DataTypeMismatch(
+                    key.to_string(), 
+                    "string".to_string(), 
+                    entry.value.data_type()
+                )),
+            }
+        } else {
+            Ok(DataType::Integer(0))
         }
     }
 
     // Command GETRANGE
     pub async fn getrange_cmd(&self, key: &str, start: isize, end: isize) -> Result<DataType, CacheError> {
-        match self.get(key).await {
-            Ok(DataType::String(s)) => {
-                let len = s.len() as isize;
-                let start_index = if start < 0 { (start + len).max(0) } else { start }.min(len);
-                let end_index = if end < 0 { (end + len).max(0) } else { end }.min(len);
+        if let Some(entry_ref) = self.data.get(key) {
+            let entry = entry_ref.value();
 
-                if start_index > end_index {
-                    return Ok(DataType::String("".to_string())); // Empty range
+            if entry.is_expired() {
+                drop(entry_ref);
+                self.data.remove(key);
+                self.size.fetch_sub(1, Ordering::Relaxed);
+                self.remove_from_lru(key).await;
+                return Ok(DataType::String("".to_string()));
+            }
+
+            if let DataType::String(s) = &entry.value {
+                let len = s.len() as isize;
+
+                let start_index = if start < 0 { (start + len).max(0) } else { start.min(len) } as usize;
+                let end_index = if end < 0 { (end + len).max(0) } else { end.min(len) } as usize;
+
+                if start_index > end_index || start_index >= s.len() {
+                    return Ok(DataType::String("".to_string()))
                 }
 
-                let range = s[start_index as usize..end_index as usize + 1].to_string();
+                // Use efficient substring operation
+                let range = if end_index >= s.len() {
+                    s[start_index..].to_string()
+                } else {
+                    s[start_index..end_index + 1].to_string()
+                };
+                
+                self.touch_key(key).await;
                 Ok(DataType::String(range))
-            },
-            Ok(DataType::Nil) => Ok(DataType::String("".to_string())), // Key doesn't exist, GETRANGE returns empty string
-            Ok(other_type) => Err(CacheError::DataTypeMismatch(key.to_string(), "string".to_string(), other_type.data_type())),
-            Err(e) => Err(e)
+            } else {
+                Err(CacheError::DataTypeMismatch(
+                    key.to_string(), 
+                    "string".to_string(), 
+                    entry.value.data_type()
+                ))
+            }
+        } else {
+            Ok(DataType::String("".to_string()))
         }
     }
 
     // Command SETRANGE
+    #[inline]
     pub async fn setrange_cmd(&self, key: &str, offset: usize, value: String) -> Result<DataType, CacheError> {
-        let mut entry_mut = self.data.entry(key.to_string()).or_insert_with(|| CacheEntry::new(DataType::String("".into()), None)); //Create empty string if key not exists
-        let entry = entry_mut.value_mut();
-
-        if let DataType::String(s) = &mut entry.value {
-            if offset > s.len() {
-                // Pad with zero bytes if offset is beyond current length
-                let padding = offset - s.len();
-                s.extend(std::iter::repeat('\0').take(padding));
-            }
-            let mut s_bytes = s.as_bytes().to_vec();
-            let value_bytes = value.as_bytes();
-
-            for (i, &byte) in value_bytes.iter().enumerate() {
-                if offset + i < s_bytes.len() {
-                    s_bytes[offset + i] = byte;
-                } else {
-                    s_bytes.push(byte);
+        if value.is_empty() {
+            // Fast path for empty value - just return current length
+            if let Some(entry_ref) = self.data.get(key) {
+                if let DataType::String(s) = &entry_ref.value().value {
+                    let len = s.len().max(offset) as i64;
+                    return Ok(DataType::Integer(len));
                 }
             }
-
-            if let Ok(updated_s) = String::from_utf8(s_bytes) {
-                entry.value = DataType::String(updated_s);
-                let new_len = entry.value.size() as i64;
-                self.touch_key(key).await;
-                Ok(DataType::Integer(new_len))
-            } else {
-                Err(CacheError::InternalError("Failed to convert updated bytes back to String".to_string()))
+        }
+        
+        // Get or create entry
+        let mut entry_writer = match self.data.get_mut(key) {
+            Some(writer) => writer,
+            None => {
+                // Create new empty string if key does not exist
+                let new_string = if offset > 0 {
+                    // Pre-allocate with zeros if offset > 0
+                    let mut s = String::with_capacity(offset + value.len());
+                    s.extend(std::iter::repeat('\0').take(offset));
+                    s
+                } else {
+                    String::new()
+                };
+                
+                self.set(key.to_string(), DataType::String(new_string), None).await;
+                self.data.get_mut(key).unwrap() // Safe since we just inserted it
             }
-
-
+        };
+        
+        let entry = entry_writer.value_mut();
+        
+        if let DataType::String(s) = &mut entry.value {
+            // Ensure the string is long enough
+            if offset > s.len() {
+                // Add null bytes as padding
+                s.extend(std::iter::repeat('\0').take(offset - s.len()));
+            }
+            
+            // Efficient string modification
+            if offset == s.len() {
+                // Append at end (common case)
+                s.push_str(&value);
+            } else {
+                // Replace in middle
+                let prefix = if offset > 0 { &s[..offset] } else { "" };
+                let new_value = format!("{}{}{}", 
+                    prefix,
+                    value,
+                    if offset + value.len() < s.len() { &s[offset + value.len()..] } else { "" }
+                );
+                *s = new_value;
+            }
+            
+            self.touch_key(key).await;
+            Ok(DataType::Integer(s.len() as i64))
         } else {
-            Err(CacheError::DataTypeMismatch(key.to_string(), "String".to_string(), entry.value.data_type()))
+            Err(CacheError::DataTypeMismatch(
+                key.to_string(),
+                "String".to_string(),
+                entry.value.data_type()
+            ))
         }
     }
 
     // Command : GETSET
+    #[inline]
     pub async fn getset_cmd(&self, key: &str, value: String) -> Result<DataType, CacheError> {
-        let existing_value = self.get(key).await.unwrap_or(DataType::Nil); // Get existing value, default to Nil if not found
-        self.set_cmd(key.to_string(), DataType::String(value), None, None).await?; // Set new value
-        Ok(existing_value) // Return the old value
+        let result = if let Some(entry_ref) = self.data.get(key) {
+            if entry_ref.is_expired() {
+                drop(entry_ref);
+                self.data.remove(key);
+                self.size.fetch_sub(1, Ordering::Relaxed);
+                self.remove_from_lru(key).await;
+                DataType::Nil
+            } else {
+                entry_ref.value().value.clone()
+            }
+        } else {
+            DataType::Nil
+        };
+
+        self.set(key.to_string(), DataType::String(value), None).await;
+        Ok(result)
     }
 
     // Command : INCR
-    async fn incr_cmd(&self, key: &str) -> Result<DataType, CacheError> {
-        let mut entry_writer = self.data.get_mut(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
-        let entry = entry_writer.value_mut();
-
-        match &mut entry.value {
-            DataType::Integer(n) => {
-                *n += 1;
-                self.touch_key(key).await;
-                Ok(DataType::Integer(*n))
-            }
-            DataType::String(s) => {
-                match s.parse::<i64>() {
-                    Ok(mut n) => {
-                        n += 1;
-                        entry.value = DataType::Integer(n);
-                        self.touch_key(key).await;
-                        Ok(DataType::Integer(n))
-                    }
-                    Err(_) => Err(CacheError::NotAnInteger),
-                }
-            },
-            _ => Err(CacheError::DataTypeMismatch(key.to_string(), "Integer or String representable as integer".to_string(), entry.value.data_type())),
-        }
+    pub async fn incr_cmd(&self, key: &str) -> Result<DataType, CacheError> {
+        self.incrby_cmd(key, 1).await
     }
 
     // Command : DECR
-    async fn decr_cmd(&self, key: &str) -> Result<DataType, CacheError> {
-        let mut entry_writer = self.data.get_mut(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
-        let entry = entry_writer.value_mut();
-
-        match &mut entry.value {
-            DataType::Integer(n) => {
-                *n -= 1;
-                self.touch_key(key).await;
-                Ok(DataType::Integer(*n))
-            },
-            DataType::String(s) => {
-                match s.parse::<i64>() {
-                    Ok(mut n) => {
-                        n -= 1;
-                        entry.value = DataType::Integer(n);
-                        self.touch_key(key).await;
-                        Ok(DataType::Integer(n))
-                    }
-                    Err(_) => Err(CacheError::NotAnInteger)
-                }
-            },
-            _ => Err(CacheError::DataTypeMismatch(key.to_string(), "Integer or String representable as integer".to_string(), entry.value.data_type())),
-        }
+    pub async fn decr_cmd(&self, key: &str) -> Result<DataType, CacheError> {
+        self.incrby_cmd(key, -1).await
     }
 
     // Command: INCRBY
+    #[inline]
     pub async fn incrby_cmd(&self, key: &str, increment: i64) -> Result<DataType, CacheError> {
-        let mut entry_writer = self.data.get_mut(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
-        let entry = entry_writer.value_mut();
+        if let Some(mut entry_writer) = self.data.get_mut(key) {
+            let entry = entry_writer.value_mut();
 
-        match &mut entry.value {
-            DataType::Integer(n) => {
-                *n += increment;
-                self.touch_key(key).await;
-                Ok(DataType::Integer(*n))
-            }
-            DataType::String(s) => {
-                match s.parse::<i64>() {
-                    Ok(mut n) => {
-                        n += increment;
-                        entry.value = DataType::Integer(n);
-                        self.touch_key(key).await;
-                        Ok(DataType::Integer(n))
-                    }
-                    Err(_) => Err(CacheError::NotAnInteger)
+            match &mut entry.value {
+                DataType::Integer(n) => {
+                    *n += increment;
+                    self.touch_key(key).await;
+                    return Ok(DataType::Integer(*n))
                 }
+                DataType::String(s) => {
+                    match s.parse::<i64>() {
+                        Ok(mut n) => {
+                            n += increment;
+                            entry.value = DataType::Integer(n);
+                            self.touch_key(key).await;
+                            return Ok(DataType::Integer(n))
+                        }
+                        Err(_) => return Err(CacheError::NotAnInteger)
+                    }
+                }
+                DataType::Nil => { // Treat Nil as 0 for INCRBY
+                    entry.value = DataType::Integer(increment);
+                    self.touch_key(key).await;
+                    return Ok(DataType::Integer(increment))
+                }
+                _ => return Err(CacheError::DataTypeMismatch(
+                    key.to_string(),
+                    "Integer or String representable as integer".to_string(),
+                    entry.value.data_type()
+                )),
             }
-            DataType::Nil => { // Treat Nil as 0 for INCRBY
-                let result = increment;
-                entry.value = DataType::Integer(result);
-                self.touch_key(key).await;
-                Ok(DataType::Integer(result))
-            }
-            _ => Err(CacheError::DataTypeMismatch(key.to_string(), "Integer or String representable as integer".to_string(), entry.value.data_type())),
         }
+
+        self.set(key.to_string(), DataType::Integer(increment), None).await;
+        Ok(DataType::Integer(increment))
+        
     }
 
     // Command : DECRBY
@@ -928,28 +523,29 @@ impl CalodShard {
 
     // Command : INCRBYFLOAT
     pub async fn incrbyfloat_cmd(&self, key: &str, increment: f64) -> Result<DataType, CacheError> {
-        let mut entry_writer = self.data.get_mut(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
-        let entry = entry_writer.value_mut();
+        if let Some(mut entry_writer) = self.data.get_mut(key) {
+            let entry = entry_writer.value_mut();
 
-        match &mut entry.value {
-            DataType::String(s) => {
-                match s.parse::<f64>() {
-                    Ok(mut n) => {
-                        n += increment;
-                        entry.value = DataType::String(format!("{}", n)); // Store as string for INCRBYFLOAT
-                        self.touch_key(key).await;
-                        Ok(DataType::String(format!("{}", n)))
+            let result = match &mut entry.value {
+                DataType::String(s) => {
+                    match s.parse::<f64>() {
+                        Ok(n) => n + increment,
+                        Err(_) => return Err(CacheError::InvalidScoreFormat)
                     }
-                    Err(_) => Err(CacheError::InvalidScoreFormat)
                 }
-            }
-            DataType::Nil => { // Treat Nil as 0.0 for INCRBYFLOAT
-                let result = increment;
-                entry.value = DataType::String(format!("{}", result));
-                self.touch_key(key).await;
-                Ok(DataType::String(format!("{}", result)))
-            }
-            _ => Err(CacheError::DataTypeMismatch(key.to_string(), "String representable as float".to_string(), entry.value.data_type())),
+                DataType::Nil => increment,
+                _ => return Err(CacheError::DataTypeMismatch(key.to_string(), "String representable as float".to_string(), entry.value.data_type())),
+            };
+
+            let result_str = format!("{}", result);
+            entry.value = DataType::String(result_str.clone());
+            self.touch_key(key).await;
+
+            Ok(DataType::String(result_str))
+        } else {
+            let result_str = format!("{}", increment);
+            self.set(key.to_string(), DataType::String(result_str.clone()), None).await;
+            Ok(DataType::String(result_str))
         }
     }
 
@@ -1496,7 +1092,7 @@ impl CalodShard {
     }
 
     // --- JSON Command Handlers ---
-    async fn json_set_cmd(&self, key: String, path: String, value_str: String) -> Result<DataType, CacheError> {
+    pub async fn json_set_cmd(&self, key: String, path: String, value_str: String) -> Result<DataType, CacheError> {
         let mut entry_mut = self.data.entry(key.clone()).or_insert_with(|| CacheEntry::new(DataType::Document(JsonValue::Null), None));
         let entry = entry_mut.value_mut();
 
@@ -1512,7 +1108,7 @@ impl CalodShard {
         }
     }
 
-    async fn json_get_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
+    pub async fn json_get_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
         match self.get(&key).await? {
             DataType::Document(doc) => {
                 let result_json_value = jsonpath_get(&doc, &path)?;
@@ -1523,7 +1119,7 @@ impl CalodShard {
         }
     }
 
-    async fn json_del_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
+    pub async fn json_del_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
 
@@ -1536,7 +1132,7 @@ impl CalodShard {
         }
     }
 
-    async fn json_type_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
+    pub async fn json_type_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
         match self.get(&key).await? {
             DataType::Document(doc) => {
                 let json_value = jsonpath_get(&doc, &path)?;
@@ -1547,7 +1143,7 @@ impl CalodShard {
         }
     }
 
-    async fn json_numincrby_cmd(&self, key: String, path: String, increment: f64) -> Result<DataType, CacheError> {
+    pub async fn json_numincrby_cmd(&self, key: String, path: String, increment: f64) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
 
@@ -1561,7 +1157,7 @@ impl CalodShard {
         }
     }
 
-    async fn json_strappend_cmd(&self, key: String, path: String, value: String) -> Result<DataType, CacheError> {
+    pub async fn json_strappend_cmd(&self, key: String, path: String, value: String) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
 
@@ -1575,7 +1171,7 @@ impl CalodShard {
         }
     }
 
-    async fn json_arrappend_cmd(&self, key: String, path: String, values: Vec<String>) -> Result<DataType, CacheError> {
+    pub async fn json_arrappend_cmd(&self, key: String, path: String, values: Vec<String>) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
 
@@ -1592,7 +1188,7 @@ impl CalodShard {
         }
     }
 
-    async fn json_objset_cmd(&self, key: String, path: String, key_to_set: String, value: String) -> Result<DataType, CacheError> {
+    pub async fn json_objset_cmd(&self, key: String, path: String, key_to_set: String, value: String) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
         let value_json: JsonValue = serde_json::from_str(&value).map_err(|e| CacheError::InvalidCommandArguments(format!("Invalid JSON value in OBJSET: {}", e)))?;
@@ -1607,7 +1203,7 @@ impl CalodShard {
         }
     }
 
-    async fn json_objkeys_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
+    pub async fn json_objkeys_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
         match self.get(&key).await? {
             DataType::Document(doc) => {
                 let keys = jsonpath_objkeys(&doc, &path)?;
@@ -1618,7 +1214,7 @@ impl CalodShard {
         }
     }
 
-    async fn json_objlen_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
+    pub async fn json_objlen_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
         match self.get(&key).await? {
             DataType::Document(doc) => {
                 let len = jsonpath_objlen(&doc, &path)?;
@@ -1629,7 +1225,7 @@ impl CalodShard {
         }
     }
 
-    async fn json_arrindex_cmd(&self, key: String, path: String, value: String, range: Option<(isize, isize)>) -> Result<DataType, CacheError> {
+    pub async fn json_arrindex_cmd(&self, key: String, path: String, value: String, range: Option<(isize, isize)>) -> Result<DataType, CacheError> {
         match self.get(&key).await? {
             DataType::Document(doc) => {
                 let value_json: JsonValue = serde_json::from_str(&value).map_err(|e| CacheError::InvalidCommandArguments(format!("Invalid JSON value in ARRINDEX: {}", e)))?;
@@ -1641,7 +1237,7 @@ impl CalodShard {
         }
     }
 
-    async fn json_arrinsert_cmd(&self, key: String, path: String, index: isize, values: Vec<String>) -> Result<DataType, CacheError> {
+    pub async fn json_arrinsert_cmd(&self, key: String, path: String, index: isize, values: Vec<String>) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
         let json_values: Result<Vec<JsonValue>, CacheError> = values.iter()
@@ -1658,7 +1254,7 @@ impl CalodShard {
         }
     }
 
-    async fn json_arrlen_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
+    pub async fn json_arrlen_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
         match self.get(&key).await? {
             DataType::Document(doc) => {
                 let len = jsonpath_arrlen(&doc, &path)?;
@@ -1669,7 +1265,7 @@ impl CalodShard {
         }
     }
 
-    async fn json_arrpop_cmd(&self, key: String, path: String, index: Option<isize>) -> Result<DataType, CacheError> {
+    pub async fn json_arrpop_cmd(&self, key: String, path: String, index: Option<isize>) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
 
@@ -1683,7 +1279,7 @@ impl CalodShard {
         }
     }
 
-    async fn json_arrtrim_cmd(&self, key: String, path: String, start: isize, stop: isize) -> Result<DataType, CacheError> {
+    pub async fn json_arrtrim_cmd(&self, key: String, path: String, start: isize, stop: isize) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
 
@@ -1698,7 +1294,7 @@ impl CalodShard {
     }
 
     // --- Graph Commands ---
-    async fn graph_create_node_cmd(&self, key: String, node_id: String, properties: Vec<(String, String)>) -> Result<DataType, CacheError> {
+    pub async fn graph_create_node_cmd(&self, key: String, node_id: String, properties: Vec<(String, String)>) -> Result<DataType, CacheError> {
         let mut entry_mut = self.data.entry(key.clone()).or_insert_with(|| CacheEntry::new(DataType::Graph(GraphData::new()), None));
         let entry = entry_mut.value_mut();
 
@@ -1719,7 +1315,7 @@ impl CalodShard {
         }
     }
 
-    async fn graph_get_node_cmd(&self, key: String, node_id: String) -> Result<DataType, CacheError> {
+    pub async fn graph_get_node_cmd(&self, key: String, node_id: String) -> Result<DataType, CacheError> {
         match self.get(&key).await? {
             DataType::Graph(graph_data) => {
                 match graph_data.get_node(&node_id) {
@@ -1738,7 +1334,7 @@ impl CalodShard {
         }
     }
 
-    async fn graph_delete_node_cmd(&self, key: String, node_id: String) -> Result<DataType, CacheError> {
+    pub async fn graph_delete_node_cmd(&self, key: String, node_id: String) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
 
@@ -1755,7 +1351,7 @@ impl CalodShard {
         }
     }
 
-    async fn graph_create_edge_cmd(&self, key: String, edge_id: String, source_node_id: String, traget_node_id: String, relation_type: String, properties: Vec<(String, String)>) -> Result<DataType, CacheError> {
+    pub async fn graph_create_edge_cmd(&self, key: String, edge_id: String, source_node_id: String, traget_node_id: String, relation_type: String, properties: Vec<(String, String)>) -> Result<DataType, CacheError> {
         let mut entry_mut = self.data.entry(key.clone()).or_insert_with(||CacheEntry::new(DataType::Graph(GraphData::new()), None));
         let entry = entry_mut.value_mut();
 
@@ -1785,7 +1381,7 @@ impl CalodShard {
     }
 
 
-    async fn graph_get_edge_cmd(&self, key: String, edge_id: String) -> Result<DataType, CacheError> {
+    pub async fn graph_get_edge_cmd(&self, key: String, edge_id: String) -> Result<DataType, CacheError> {
         match self.get(&key).await? {
             DataType::Graph(graph_data) => {
                 match graph_data.get_edge(&edge_id) {
@@ -1808,7 +1404,7 @@ impl CalodShard {
         }
     }
 
-    async fn graph_delete_edge_cmd(&self, key: String, edge_id: String) -> Result<DataType, CacheError> {
+    pub async fn graph_delete_edge_cmd(&self, key: String, edge_id: String) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
 
@@ -1825,7 +1421,7 @@ impl CalodShard {
         }
     }
 
-    async fn graph_get_node_properties_cmd(&self, key: String, node_id: String) -> Result<DataType, CacheError> {
+    pub async fn graph_get_node_properties_cmd(&self, key: String, node_id: String) -> Result<DataType, CacheError> {
         match self.get(&key).await? {
             DataType::Graph(graph_data) => {
                 match graph_data.get_node(&node_id) {
@@ -1842,7 +1438,7 @@ impl CalodShard {
         }
     }
 
-    async fn graph_set_node_property_cmd(&self, key: String, node_id: String, property_key: String, property_value: String) -> Result<DataType, CacheError>  {
+    pub async fn graph_set_node_property_cmd(&self, key: String, node_id: String, property_key: String, property_value: String) -> Result<DataType, CacheError>  {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
 
@@ -1860,7 +1456,7 @@ impl CalodShard {
         }
     }
 
-    async fn graph_delete_node_property_cmd(&self, key: String, node_id: String, property_key: String) -> Result<DataType, CacheError> {
+    pub async fn graph_delete_node_property_cmd(&self, key: String, node_id: String, property_key: String) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
 
@@ -1878,7 +1474,7 @@ impl CalodShard {
         }
     }
 
-    async fn graph_get_edge_properties_cmd(&self, key: String, edge_id: String) -> Result<DataType, CacheError> {
+    pub async fn graph_get_edge_properties_cmd(&self, key: String, edge_id: String) -> Result<DataType, CacheError> {
         match self.get(&key).await? {
             DataType::Graph(graph_data) => {
                 match graph_data.get_edge(&edge_id) {
@@ -1895,7 +1491,7 @@ impl CalodShard {
         }
     }
 
-    async fn graph_set_edge_property_cmd(&self, key: String, edge_id: String, property_key: String, property_value: String) -> Result<DataType, CacheError> {
+    pub async fn graph_set_edge_property_cmd(&self, key: String, edge_id: String, property_key: String, property_value: String) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
 
@@ -1913,7 +1509,7 @@ impl CalodShard {
         }
     }
 
-    async fn graph_delete_edge_property_cmd(&self, key: String, edge_id: String, property_key: String) -> Result<DataType, CacheError> {
+    pub async fn graph_delete_edge_property_cmd(&self, key: String, edge_id: String, property_key: String) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
 
@@ -1931,54 +1527,67 @@ impl CalodShard {
         }
     }
 
-    async fn touch_key(&self, key: &str) {
-        let mut lru = self.lru.lock().await;
-        lru.retain(|k| k != key);
-        lru.push_front(key.to_string());
+    /// Touch a key in the LRU (mark as recently used)
+    #[inline]
+    pub async fn touch_key(&self, key: &str) {
+        let segment_idx = self.get_lru_segment(key);
+        let key = key.to_string();
+
+        let mut lru = self.lru_segments[segment_idx].write().unwrap();
+
+        if let Some(pos) = lru.iter().position(|k| k == &key) {
+            lru.remove(pos);
+        }
+        lru.push_front(key);
     }
 
-    async fn remove_from_lru(&self, key: &str) {
-        let mut lru = self.lru.lock().await;
-        lru.retain(|k| k != key);
+    /// Remove a key from the LRU
+    #[inline]
+    pub async fn remove_from_lru(&self, key: &str) {
+        let segment_idx = self.get_lru_segment(key);
+        let mut lru = self.lru_segments[segment_idx].write().unwrap();
+
+        if let Some(pos) = lru.iter().position(|k| k == key) {
+            lru.remove(pos);
+        }
     }
 
-    async fn evict(&self) {
-        let mut candidates = BinaryHeap::new();
-        let lru = self.lru.lock().await;
+    pub async fn evict(&self) {
+        // let mut candidates = BinaryHeap::new();
 
-        for key in lru.iter().rev().take(5) {
-            if let Some(entry) = self.data.get(key) {
-                let score = entry.eviction_score();
-                candidates.push(EvictionCandidate {
-                    key: key.clone(),
-                    score,
-                });
-            }
-        }
+        // for key in lru.iter().rev().take(5) {
+        //     if let Some(entry) = self.data.get(key) {
+        //         let score = entry.eviction_score();
+        //         candidates.push(EvictionCandidate {
+        //             key: key.clone(),
+        //             score,
+        //         });
+        //     }
+        // }
 
-        if let Some(candidate) = candidates.pop() {
-            if self.data.remove(&candidate.key).is_some() {
-                self.size.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        }
+        // if let Some(candidate) = candidates.pop() {
+        //     if self.data.remove(&candidate.key).is_some() {
+        //         self.size.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        //     }
+        // }
     }
 }
 
 
 impl CalodShard {    
-    async fn save(&self, path: &str) -> Result<(), PersistenceError> {
+    pub async fn save(&self, path: &str) -> Result<(), PersistenceError> {
         let data = self.data.iter().map(|entry| (entry.key().clone(), entry.value().clone())).collect::<Vec<_>>();
 
-        let encoded = serialize(&data).map_err(PersistenceError::SerializationError)?;
+        let encoded = serialize(&data).map_err(PersistenceError::Serialization)?;
 
-        write(path, &encoded).await.map_err(PersistenceError::IoError)?;
+        write(path, &encoded).await.map_err(PersistenceError::Io)?;
 
         Ok(())
     }
 
-    async fn load(&self, path: &str) -> Result<(), PersistenceError> {
-        let encoded = read(path).await.map_err(PersistenceError::IoError)?;
-        let data: Vec<(String, CacheEntry)> = deserialize(&encoded).map_err(PersistenceError::SerializationError)?;
+    pub async fn load(&self, path: &str) -> Result<(), PersistenceError> {
+        let encoded = read(path).await.map_err(PersistenceError::Io)?;
+        let data: Vec<(String, CacheEntry)> = deserialize(&encoded).map_err(PersistenceError::Serialization)?;
 
         for (key, entry) in data {
             self.data.insert(key, entry);
