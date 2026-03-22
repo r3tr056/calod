@@ -1,7 +1,7 @@
 use core::f64;
-use std::sync::Arc;
+use std::{sync::Arc, time::{Duration, SystemTime, UNIX_EPOCH}};
 use atomic_refcell::AtomicRefCell;
-use chrono::{DateTime, Utc, Duration as ChronoDuration};
+use chrono::{DateTime, Utc};
 use dashmap::{DashMap, DashSet};
 
 use serde_with::serde_as;
@@ -16,19 +16,22 @@ use crate::extensions::fastgraphdb::base::GraphData;
 pub struct CacheEntry {
     #[serde(flatten)]
     pub value: DataType,
-    #[serde(with = "chrono::serde::ts_milliseconds")]
-    pub created_at: DateTime<Utc>,
-    #[serde(with = "chrono::serde::ts_milliseconds_option")]
-    pub expires_at: Option<DateTime<Utc>>,
-    // size_bytes: usize,
+    /// Created at Timestamp in millis
+    pub created_at_ms: u64,
+    /// Expiry timestamp in millis
+    pub expires_at_ms: u64,
 }
 
 impl CacheEntry {
-    pub fn new(value: DataType, ttl: Option<ChronoDuration>) -> Self {
-        let created_at = Utc::now();
-        let expires_at = ttl.map(|duration| created_at + duration);
+    pub fn new(value: DataType, ttl: Option<Duration>) -> Self {
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
 
-        Self { value, expires_at, created_at}
+        let expires_at_ms = ttl.map(|duration| now_ms + duration.as_millis() as u64).unwrap_or(0);
+
+        Self { value, created_at_ms: now_ms, expires_at_ms }
     }
 
     pub fn size(&self) -> usize {
@@ -36,14 +39,19 @@ impl CacheEntry {
     }
 
     pub fn is_expired(&self) -> bool {
-        self.expires_at.map_or(false, |exp| exp <= Utc::now())
+        if self.expires_at_ms == 0 { false } else {
+            let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+            now_ms >= self.expires_at_ms
+        }
     }
 
     pub fn eviction_score(&self) -> f64 {
-        let age_ms = Utc::now().timestamp_millis() - self.created_at.timestamp_millis().max(0); // // Ensure age is non-negative
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+        let age_ms = now_ms.saturating_sub(self.created_at_ms);
 
-        // Ensure expiry_seconds is non-negative
-        let expiry_score = self.expires_at.map_or(f64::MAX, |exp| (exp - Utc::now()).num_seconds().max(0) as f64);
+        let expiry_score = if self.expires_at_ms == 0 { f64::MAX } else {
+            self.expires_at_ms.saturating_sub(now_ms) as f64 / 1000.0
+        };
         
         let age_component = (age_ms * 7) >> 3; // age_ms * 0.875 (close to 0.7, using bit shift for division by 8)
         let expiry_component = (expiry_score * 3.0) / 10.0; // expiry_seconds * 0.3
@@ -52,18 +60,25 @@ impl CacheEntry {
     }
 
     pub fn expire_in(&mut self, duration: std::time::Duration) {
-        self.expires_at = Some(Utc::now() + ChronoDuration::from_std(duration).unwrap_or(ChronoDuration::max_value()));
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.expires_at_ms = now_ms + duration.as_millis() as u64;
     }
 
-    pub fn ttl(&self) -> Option<ChronoDuration> {
-        self.expires_at.map(|expiry_time| {
-            let now = Utc::now();
-            expiry_time - now
-        })
+    pub fn ttl(&self) -> Option<i64> {
+        if self.expires_at_ms == 0 { None } else {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            Some((self.expires_at_ms.saturating_sub(now_ms) / 1000) as i64)
+        }
     }
 
     pub fn persist(&mut self) {
-        self.expires_at = None;
+        self.expires_at_ms = 0;
     }
 }
 

@@ -6,6 +6,7 @@ use tracing::{error, info};
 use crate::cld_srv::command::{InsertOption, SetExpireOption, SetOption};
 
 use super::calod_data::DataType;
+use super::directory::Directory;
 use super::calod_shard::CalodShard;
 use super::config::CalodConfig;
 use super::error::CacheError;
@@ -16,14 +17,17 @@ type ShardIndex = usize;
 
 pub struct ShardedStore {
     shards: Vec<Arc<CalodShard>>,
+    shard_mask: u64,
     metrics: Arc<CalodMetrics>,
-    config: Arc<CalodConfig>
+    config: Arc<CalodConfig>,
+    /// Global directory (local view) mapping key hash -> physical metadata
+    directory: Arc<Directory>,
 }
 
 impl ShardedStore {
     /// Create a new sharded store with the given configuration
     pub fn new(config: CalodConfig) -> Self {
-        let num_shards = config.shards;
+        let num_shards = config.shards.next_power_of_two();
         let shard_capacity = config.shard_capacity / num_shards;
         let metrics = Arc::new(CalodMetrics::default());
         
@@ -42,15 +46,24 @@ impl ShardedStore {
         Self {
             shards,
             metrics,
+            shard_mask: (num_shards - 1) as u64,
             config: Arc::new(config),
+            directory: Directory::new(),
         }
     }
 
-    /// Get the shard index for a given key
-    pub fn get_shard_index<K: Hash + ?Sized>(&self, key: &K) -> ShardIndex where K:AsRef<[u8]> {
+    /// Get the shard index asn hash for a given key
+    #[inline]
+    pub fn get_shard_index_and_hash<K: Hash + ?Sized>(&self, key: &K) -> (ShardIndex, u64) {
         let mut hasher = AHasher::default();
         key.hash(&mut hasher);
-        (hasher.finish() % self.shards.len() as u64) as usize
+        let hash = hasher.finish();
+        ((hash & self.shard_mask) as usize, hash)
+    }
+
+    /// Get Shard index for a given key
+    pub fn get_shard_index<K: Hash + ?Sized>(&self, key: &K) -> ShardIndex {
+        self.get_shard_index_and_hash(key).0
     }
 
     /// Get a reference to the shard that contains the given key
@@ -190,7 +203,14 @@ impl ShardedStore {
 
     pub async fn set_cmd(&self, key: String, value: String, expire_option: Option<SetExpireOption>, set_option: Option<SetOption>) -> Result<(), CacheError> {
         let shard = self.get_shard(&key);
-        shard.set_cmd(key, DataType::String(value), expire_option, set_option).await
+        // We capture length before move
+        let val_len = value.len();
+        shard.set_cmd(key.clone(), DataType::String(value), expire_option, set_option).await?;
+        // Publish directory entry (best effort, ignore collisions for now)
+        let key_hash = Directory::hash_key(&key);
+        let shard_id = shard.id() as u32;
+        self.directory.publish(key_hash, shard_id, val_len);
+        Ok(())
     }
 
     pub async fn append_cmd(&self, key: &str, value: String) -> Result<DataType, CacheError> {
@@ -244,7 +264,10 @@ impl ShardedStore {
     pub async fn mset_cmd(&self, key_values: Vec<(String, String)>) -> Result<(), CacheError> {
         for (key, value) in key_values {
             let shard = self.get_shard(&key);
-            shard.set_cmd(key, DataType::String(value), None, None).await?; // No expiry/option for MSET in this example
+            let val_len = value.len();
+            shard.set_cmd(key.clone(), DataType::String(value), None, None).await?; // No expiry/option for MSET in this example
+            let key_hash = Directory::hash_key(&key);
+            self.directory.publish(key_hash, shard.id() as u32, val_len);
         }
         Ok(())
     }

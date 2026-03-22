@@ -1,6 +1,11 @@
-pub mod calod_store;
+pub mod calod_shard;
 pub mod calod_data;
 pub mod metrics;
 pub mod config;
 pub mod helpers;
 pub mod graph;
+pub mod types;
+pub mod error;
+pub mod sharded_store;
+pub mod persistence;
+pub mod directory;

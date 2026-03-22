@@ -1,9 +1,10 @@
-use chrono::Duration as ChronoDuration;
 use dashmap::DashMap;
+use lru::LruCache;
 use tokio::sync::broadcast;
 use tokio::time::timeout;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{Ordering, AtomicUsize};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -13,7 +14,7 @@ use serde_json::{json, Error as SerdeJsonError, Value as JsonValue};
 use bincode::{serialize, deserialize};
 use tokio::fs::{read, write};
 use crate::cld_srv::command::{InsertOption, SetExpireOption, SetOption};
-use crate::store::calod_data::CacheEntry;
+use crate::store::calod_data::{CacheEntry, EvictionCandidate};
 use crate::extensions::fastgraphdb::base::{Edge, GraphData, Node};
 
 use super::calod_data::DataType;
@@ -24,13 +25,37 @@ use super::metrics::CalodMetrics;
 static OK_RESPONSE: &str = "OK";
 static NONE_TYPE: &str = "none";
 
-
-/// Individual shard in the Calod Store
+/// A single shard of the Calod in‑memory data store.
+///
+/// Each `CalodShard` manages a partition of the global keyspace. It provides:
+///
+/// * Concurrent access to heterogeneous value types (`DataType`).
+/// * Per‑entry TTL / expiration management.
+/// * An approximate LRU based eviction policy backed by an in‑memory `LruCache` of key hashes.
+/// * Pub/Sub style list modification notifications used for blocking list commands (BLPOP / BRPOP).
+/// * JSON (document) sub‑path manipulation helpers.
+/// * Hash / List / String / Numeric / Graph primitives inspired by Redis semantics.
+/// * Persistence (binary snapshot save / load) for durability between restarts.
+///
+/// Concurrency Model:
+/// * Key/value storage uses `DashMap` for lock sharded concurrency.
+/// * The LRU structure is protected by an `RwLock` but only accessed opportunistically using `try_write` / `try_read` to avoid contention on the hot path.
+/// * All mutation helpers attempt to touch the LRU to maintain recency ordering; if the lock is contended, the miss is ignored (best effort policy).
+///
+/// Eviction:
+/// * When capacity is exceeded, we collect a bounded set of recent keys (up to MAX_CANDIDATES) from the LRU and rank them via an eviction score provided by `CacheEntry`.
+/// * We evict until the shard occupancy falls below 80% of configured capacity (hysteresis to reduce churn).
+///
+/// Safety & Invariants:
+/// * `size` tracks logical key count (non expired). Expired keys are lazily removed during command access.
+/// * Methods returning `DataType::Nil` follow Redis‑like semantics for absence or special conditions.
+///
+/// NOTE: Many methods are `async` to integrate uniformly with higher‑level async command handling even if they do not perform awaited IO themselves.
 pub struct CalodShard {
     /// Main data storage
     data: DashMap<String, CacheEntry, ahash::RandomState>,
-    /// LRU tracking - Using segmented LRU to reduce lock contention
-    lru_segments: Vec<RwLock<VecDeque<String>>>,
+    /// LRU tracking - Using LRU to avoid new allocations
+    lru_cache: Arc<RwLock<LruCache<u64, ()>>>,
     /// Shard capacity
     capacity: AtomicUsize,
     /// Current size
@@ -41,46 +66,35 @@ pub struct CalodShard {
     list_modification_notifier: broadcast::Sender<String>,
     /// Shard ID
     id: usize,
-    /// Number of LRU segments for reducing contention
-    lru_segments_count: usize,
 }
 
 impl CalodShard {
+    /// Create a new shard with a maximum key capacity.
+    ///
+    /// * `capacity` – Logical maximum number of keys before eviction is triggered.
+    /// * `metrics` – Shared metrics collector.
+    /// * `id` – Monotonically assigned shard identifier.
     pub fn new(capacity: usize, metrics: Arc<CalodMetrics>, id: usize) -> Self {
-        let lru_segments_count = std::cmp::max(
-            std::thread::available_parallelism().map(|p| p.get() * 2).unwrap_or(8), 8);
-
-        let mut lru_segments = Vec::with_capacity(lru_segments_count);
-        for _ in 0..lru_segments_count {
-            lru_segments.push(RwLock::new(VecDeque::new()));
-        }
-
         let data = DashMap::with_hasher(ahash::RandomState::new());
+        let lru_capacity = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(1000).unwrap());
+        let lru_cache = Arc::new(RwLock::new(LruCache::new(lru_capacity)));
 
         Self {
             data,
-            lru_segments,
+            lru_cache,
             capacity: AtomicUsize::new(capacity),
             size: AtomicUsize::new(0),
             list_modification_notifier: broadcast::channel(1024).0,
             metrics,
-            id,
-            lru_segments_count
+            id
         }
     }
 
-    /// Get the shard ID
+    /// Return this shard's numeric identifier.
     pub fn id(&self) -> usize { self.id }
 
-    #[inline]
-    fn get_lru_segment(&self, key: &str) -> usize {
-        let mut hasher = ahash::AHasher::default();
-        key.hash(&mut hasher);
-        let hash = hasher.finish();
-        (hash as usize) % self.lru_segments_count
-    }
-
-    // Command: TYPE, Returns the datatype
+    /// Command: TYPE – Return the stored value logical type for `key`.
+    /// Returns `DataType::Nil` if key is expired or absent. For absent key we return a string "none" to match Redis semantics.
     pub async fn type_cmd(&self, key: &str) -> Result<DataType, CacheError> {
         if let Some(entry_ref) = self.data.get(key) {
             let entry = entry_ref.value();
@@ -98,7 +112,8 @@ impl CalodShard {
         }
     }
 
-    // Command: KEYS, Returns the keys in the store matching a regex pattern string
+    /// Command: KEYS – Return keys containing the provided substring `pattern`.
+    /// NOTE: This is a simple substring match, not a glob. Expired keys are skipped.
     pub async fn keys(&self, pattern: &str) -> Vec<String> {
         trace!("Shard getting keys with pattern: {}", pattern);
 
@@ -114,7 +129,7 @@ impl CalodShard {
         results
     }
 
-    // Command: EXISTS, Returns whether a key exists in the datastore
+    /// Command: EXISTS – Return true if key exists and is not expired. Expired keys are purged lazily.
     #[inline]
     pub async fn exists(&self, key: &str) -> bool {
         trace!("Shard checking exists for key: {}", key);
@@ -135,7 +150,7 @@ impl CalodShard {
         }
     }
 
-    // Command: EXPIRE, Expires a key with a set timeout
+    /// Command: EXPIRE – Set a relative expiration (in seconds) for key.
     #[inline]
     pub async fn expire(&self, key: &str, seconds: u64) -> Result<bool, CacheError> {
         if let Some(mut entry_writer) = self.data.get_mut(key) {
@@ -147,7 +162,7 @@ impl CalodShard {
         }
     }
 
-    // Command: TTL
+    /// Command: TTL – Return remaining TTL in seconds (if any). Returns error if key is missing or expired.
     #[inline]
     pub async fn ttl(&self, key: &str) -> Result<Option<i64>, CacheError> {
         if let Some(entry_ref) = self.data.get(key) {
@@ -161,13 +176,13 @@ impl CalodShard {
             }
 
             self.touch_key(key).await;
-            Ok(entry.ttl().map(|expiry| expiry.num_seconds()))
+            Ok(entry.ttl())
         } else {
             Err(CacheError::KeyNotFound(key.to_string()))
         }
     }
 
-    // Command : PERSIST
+    /// Command: PERSIST – Remove the expiration from a key.
     #[inline]
     pub async fn persist(&self, key: &str) -> Result<bool, CacheError> {
         if let Some(mut entry_writer) = self.data.get_mut(key) {
@@ -179,7 +194,7 @@ impl CalodShard {
         }
     }
 
-    // Command : DEL
+    /// Command: DEL – Delete a key. Returns true if key existed.
     #[inline]
     pub async fn delete(&self, key: &str) -> bool {
         trace!("Shard deleting key: {}", key);
@@ -197,7 +212,7 @@ impl CalodShard {
     }
 
     // Strings/Numbers Commands
-    // Command: GET
+    /// Command: GET – Fetch a key's value. Returns `KeyNotFound` or `KeyExpired` errors.
     #[inline]
     pub async fn get(&self, key: &str) -> Result<DataType, CacheError> {
         trace!("Shard getting key: {}", key);
@@ -219,12 +234,12 @@ impl CalodShard {
         }
     }
 
-    // Command: SET
+    /// Command: SET – Set value with optional expiration + conditional flags (NX / XX).
     #[inline]
     pub async fn set_cmd(&self, key: String, value: DataType, expire_option: Option<SetExpireOption>, set_option: Option<SetOption>) -> Result<(), CacheError> {
-        let ttl_duration: Option<ChronoDuration> = match expire_option {
-            Some(SetExpireOption::EX(seconds)) => Some(ChronoDuration::seconds(seconds as i64)),
-            Some(SetExpireOption::PX(milliseconds)) => Some(ChronoDuration::milliseconds(milliseconds as i64)),
+        let ttl_duration: Option<Duration> = match expire_option {
+            Some(SetExpireOption::EX(seconds)) => Some(Duration::from_secs(seconds)),
+            Some(SetExpireOption::PX(milliseconds)) => Some(Duration::from_millis(milliseconds)),
             None => None,
         };
 
@@ -240,9 +255,9 @@ impl CalodShard {
         Ok(())
     }
 
-    // Command: SET
+    /// Internal helper implementing unconditional set with optional TTL.
     #[inline]
-    pub async fn set(&self, key: String, value: DataType, ttl: Option<ChronoDuration>) -> Option<DataType> {
+    pub async fn set(&self, key: String, value: DataType, ttl: Option<Duration>) -> Option<DataType> {
         trace!("Shard setting key: {}", key);
         
         // check if we need to evict before adding a new entry
@@ -266,7 +281,7 @@ impl CalodShard {
         old_entry
     }
 
-    // Command : APPEND
+    /// Command: APPEND – Append bytes to existing string or create a new one. Returns new length.
     #[inline]
     pub async fn append_cmd(&self, key: &str, value: String) -> Result<DataType, CacheError> {
         // Fast path for common case - check if key exists and is string
@@ -275,15 +290,8 @@ impl CalodShard {
             
             // Handle string case
             if let DataType::String(s) = &mut entry.value {
-                // Pre-allocate exact capacity needed to avoid reallocation
-                let old_len = s.len();
-                let new_len = old_len + value.len();
-                
-                if s.capacity() < new_len {
-                    s.reserve(new_len - old_len);
-                }
-                
                 s.push_str(&value);
+                let new_len = s.len();
                 self.touch_key(key).await;
                 return Ok(DataType::Integer(new_len as i64));
             } else {
@@ -295,13 +303,14 @@ impl CalodShard {
             }
         }
         
-        // Key doesn't exist, create new entry
-        let new_len = value.len() as i64;
+        // Key doesn't exist, create new entry with pre-allocated capacity
+        let len = value.len();
         self.set(key.to_string(), DataType::String(value), None).await;
-        Ok(DataType::Integer(new_len))
+        Ok(DataType::Integer(len as i64))
+
     }
 
-    // Command: STRLEN
+    /// Command: STRLEN – Length of string value or 0 for non existent / expired.
     #[inline]
     pub async fn strlen_cmd(&self, key: &str) -> Result<DataType, CacheError> {
         if let Some(entry_ref) = self.data.get(key) {
@@ -332,7 +341,7 @@ impl CalodShard {
         }
     }
 
-    // Command GETRANGE
+    /// Command: GETRANGE – Return substring (inclusive end index logic consistent with Redis).
     pub async fn getrange_cmd(&self, key: &str, start: isize, end: isize) -> Result<DataType, CacheError> {
         if let Some(entry_ref) = self.data.get(key) {
             let entry = entry_ref.value();
@@ -356,14 +365,14 @@ impl CalodShard {
                 }
 
                 // Use efficient substring operation
-                let range = if end_index >= s.len() {
-                    s[start_index..].to_string()
+                let result = if end_index >= s.len() {
+                    s[start_index..].to_owned()
                 } else {
-                    s[start_index..end_index + 1].to_string()
+                    s[start_index..=end_index].to_owned()
                 };
                 
                 self.touch_key(key).await;
-                Ok(DataType::String(range))
+                Ok(DataType::String(result))
             } else {
                 Err(CacheError::DataTypeMismatch(
                     key.to_string(), 
@@ -376,7 +385,7 @@ impl CalodShard {
         }
     }
 
-    // Command SETRANGE
+    /// Command: SETRANGE – Overwrite string starting at `offset`, padding with null bytes if required.
     #[inline]
     pub async fn setrange_cmd(&self, key: &str, offset: usize, value: String) -> Result<DataType, CacheError> {
         if value.is_empty() {
@@ -443,7 +452,7 @@ impl CalodShard {
         }
     }
 
-    // Command : GETSET
+    /// Command: GETSET – Atomically get previous value and set to new string.
     #[inline]
     pub async fn getset_cmd(&self, key: &str, value: String) -> Result<DataType, CacheError> {
         let result = if let Some(entry_ref) = self.data.get(key) {
@@ -464,17 +473,17 @@ impl CalodShard {
         Ok(result)
     }
 
-    // Command : INCR
+    /// Command: INCR – Increment integer value (auto initialize as 0). Errors if not integer-parsable.
     pub async fn incr_cmd(&self, key: &str) -> Result<DataType, CacheError> {
         self.incrby_cmd(key, 1).await
     }
 
-    // Command : DECR
+    /// Command: DECR – Decrement integer value.
     pub async fn decr_cmd(&self, key: &str) -> Result<DataType, CacheError> {
         self.incrby_cmd(key, -1).await
     }
 
-    // Command: INCRBY
+    /// Command: INCRBY – Adjust integer by `increment`.
     #[inline]
     pub async fn incrby_cmd(&self, key: &str, increment: i64) -> Result<DataType, CacheError> {
         if let Some(mut entry_writer) = self.data.get_mut(key) {
@@ -515,13 +524,13 @@ impl CalodShard {
         
     }
 
-    // Command : DECRBY
+    /// Command: DECRBY – Adjust integer by negative decrement.
     pub async fn decrby_cmd(&self, key: &str, decrement: i64) -> Result<DataType, CacheError> {
         // Reuse incrby_cmd with negative increment for DECRBY
         self.incrby_cmd(key, -decrement).await
     }
 
-    // Command : INCRBYFLOAT
+    /// Command: INCRBYFLOAT – Increment floating-point stored as string.
     pub async fn incrbyfloat_cmd(&self, key: &str, increment: f64) -> Result<DataType, CacheError> {
         if let Some(mut entry_writer) = self.data.get_mut(key) {
             let entry = entry_writer.value_mut();
@@ -550,7 +559,7 @@ impl CalodShard {
     }
 
     // Hash Commands
-    // Command: HSET
+    /// Command: HSET – Set one or more hash fields. Returns number of new fields added.
     pub async fn hset_cmd(&self, key: &str, field_values: Vec<(String, String)>) -> Result<DataType, CacheError> {
         let mut entry_mut = self.data.entry(key.to_string()).or_insert_with(|| CacheEntry::new(DataType::Hash(DashMap::new()), None));
         let entry = entry_mut.value_mut();
@@ -570,6 +579,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: HGET – Get a single hash field.
     pub async fn hget_cmd(&self, key: &str, field: String) -> Result<DataType, CacheError> {
         let entry_ref = self.data.get(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_ref.value();
@@ -587,6 +597,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: HDEL – Delete one or more hash fields. Returns count removed.
     pub async fn hdel_cmd(&self, key: &str, fields: Vec<String>) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -605,6 +616,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: HEXISTS – Test hash field existence (1 / 0).
     pub async fn hexists_cmd(&self, key: &str, field: String) -> Result<DataType, CacheError> {
         let entry_ref = self.data.get(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_ref.value();
@@ -617,6 +629,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: HGETALL – Return full hash snapshot.
     pub async fn hgetall_cmd(&self, key: &str) -> Result<DataType, CacheError> {
         let entry_ref = self.data.get(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_ref.value();
@@ -629,6 +642,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: HINCRBY – Increment integer stored at hash field.
     pub async fn hincrby_cmd(&self, key: &str, field: String, increment: i64) -> Result<DataType, CacheError> {
         let mut entry_mut = self.data.entry(key.to_string()).or_insert_with(|| CacheEntry::new(DataType::Hash(DashMap::new()), None));
         let entry = entry_mut.value_mut();
@@ -647,6 +661,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: HINCRBYFLOAT – Increment float stored at hash fields (batched variant returning updated map subset).
     pub async fn hincrbyfloat_cmd(&self, key: &str, key_field_increment: Vec<(String, f64)>) -> Result<DataType, CacheError> {
         let mut entry_mut = self.data.entry(key.to_string()).or_insert_with(|| CacheEntry::new(DataType::Hash(DashMap::new()), None));
         let entry = entry_mut.value_mut();
@@ -670,6 +685,7 @@ impl CalodShard {
     }
 
 
+    /// Command: HKEYS – Return vector of field names.
     pub async fn hkeys_cmd(&self, key: &str) -> Result<DataType, CacheError> {
         let entry_ref = self.data.get(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_ref.value();
@@ -683,6 +699,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: HLEN – Return number of fields.
     pub async fn hlen_cmd(&self, key: &str) -> Result<DataType, CacheError> {
         let entry_ref = self.data.get(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_ref.value();
@@ -695,6 +712,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: HMGET – Bulk get of multiple hash fields.
     pub async fn hmget_cmd(&self, key: &str, fields: Vec<String>) -> Result<DataType, CacheError> {
         let entry_ref = self.data.get(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_ref.value();
@@ -714,6 +732,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: HMSET – Bulk set of multiple hash fields.
     pub async fn hmset_cmd(&self, key: &str, field_values: Vec<(String, String)>) -> Result<DataType, CacheError> {
         let mut entry_mut = self.data.entry(key.to_string()).or_insert_with(|| CacheEntry::new(DataType::Hash(DashMap::new()), None));
         let entry = entry_mut.value_mut();
@@ -723,12 +742,13 @@ impl CalodShard {
                 hash_map.insert(field, value);
             }
             self.touch_key(key).await;
-            Ok(DataType::String("OK".to_string())) // HMSET returns OK Simple String
+            Ok(DataType::String(OK_RESPONSE.to_string())) // HMSET returns OK Simple String
         } else {
             Err(CacheError::DataTypeMismatch(key.to_string(), "Hash".to_string(), entry.value.data_type()))
         }
     }
 
+    /// Command: HSETNX – Set hash field only if absent.
     pub async fn hsetnx_cmd(&self, key: &str, field: String, value: String) -> Result<DataType, CacheError> {
         let mut entry_mut = self.data.entry(key.to_string()).or_insert_with(|| CacheEntry::new(DataType::Hash(DashMap::new()), None));
         let entry = entry_mut.value_mut();
@@ -746,6 +766,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: HVALS – Return collection of hash values.
     pub async fn hvals_cmd(&self, key: &str) -> Result<DataType, CacheError> {
         let entry_ref = self.data.get(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_ref.value();
@@ -761,6 +782,7 @@ impl CalodShard {
 
     // List commands
 
+    /// Command: LPUSH – Push values to the head of list (reverse order of arguments).
     pub async fn lpush_cmd(&self, key: String, values: Vec<String>) -> Result<DataType, CacheError> {
         let mut entry_mut = self.data.entry(key.clone()).or_insert_with(|| CacheEntry::new(DataType::List(Vec::new()), None));
         let entry = entry_mut.value_mut();
@@ -777,6 +799,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: RPUSH – Push values to the tail of list.
     pub async fn rpush_cmd(&self, key: String, values: Vec<String>) -> Result<DataType, CacheError> {
         let mut entry_mut = self.data.entry(key.clone()).or_insert_with(|| CacheEntry::new(DataType::List(Vec::new()), None));
         let entry = entry_mut.value_mut();
@@ -793,6 +816,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: LPOP – Pop head element.
     pub async fn lpop_cmd(&self, key: &str) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -810,6 +834,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: RPOP – Pop tail element.
     pub async fn rpop_cmd(&self, key: &str) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -827,6 +852,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: LLEN – List length.
     pub async fn llen_cmd(&self, key: &str) -> Result<DataType, CacheError> {
         let entry_ref = self.data.get(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_ref.value();
@@ -839,6 +865,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: LRANGE – Return sub-slice (inclusive end) of list.
     pub async fn lrange_cmd(&self, key: &str, start: isize, end: isize) -> Result<DataType, CacheError> {
         let entry_ref = self.data.get(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_ref.value();
@@ -860,6 +887,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: LINDEX – Random access by positive / negative index.
     pub async fn lindex_cmd(&self, key: &str, index: isize) -> Result<DataType, CacheError> {
         let entry_ref = self.data.get(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_ref.value();
@@ -877,6 +905,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: LINSERT – Insert before / after pivot.
     pub async fn linsert_cmd(&self, key: &str, before_after: InsertOption, pivot: String, value: String) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -898,6 +927,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: LSET – Overwrite element at index.
     pub async fn lset_cmd(&self, key: &str, index: isize, value: String) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -911,12 +941,13 @@ impl CalodShard {
             }
             list[index_pos as usize] = value;
             self.touch_key(key).await;
-            Ok(DataType::String("OK".to_string())) // LSET returns OK Simple String
+            Ok(DataType::String(OK_RESPONSE.to_string())) // LSET returns OK Simple String
         } else {
             Err(CacheError::DataTypeMismatch(key.to_string(), "List".to_string(), entry.value.data_type()))
         }
     }
 
+    /// Command: LTRIM – Keep only specified inclusive range.
     pub async fn ltrim_cmd(&self, key: &str, start: isize, end: isize) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -933,12 +964,13 @@ impl CalodShard {
                 entry.value = DataType::List(trimmed_list.into()); // Replace list with trimmed version
             }
             self.touch_key(key).await;
-            Ok(DataType::String("OK".to_string())) // LTRIM returns OK Simple String
+            Ok(DataType::String(OK_RESPONSE.to_string())) // LTRIM returns OK Simple String
         } else {
             Err(CacheError::DataTypeMismatch(key.to_string(), "List".to_string(), entry.value.data_type()))
         }
     }
     
+    /// Command: LREM – Remove occurrences of value according to count semantics.
     pub async fn lrem_cmd(&self, key: &str, count: i64, value: String) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -995,6 +1027,7 @@ impl CalodShard {
     }
 
 
+    /// Command: RPOPLPUSH – Pop from source tail and push to destination head.
     pub async fn rpoplpush_cmd(&self, source: &str, destination: &str) -> Result<DataType, CacheError> {
         let popped_value_result = self.rpop_cmd(source).await; // RPOP from source list
 
@@ -1009,6 +1042,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: BLPOP – Blocking pop (head) from first non-empty list among `keys` within timeout.
     pub async fn blpop_cmd(&self, keys: Vec<String>, timeout_sec: f64) -> Result<DataType, CacheError> {
         let timeout_duration = Duration::from_secs_f64(timeout_sec.max(0.0));
         let mut notification_receiver = self.list_modification_notifier.subscribe();
@@ -1050,6 +1084,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: BRPOP – Blocking pop (tail) variant.
     pub async fn brpop_cmd(&self, keys: Vec<String>, timeout_sec: f64) -> Result<DataType, CacheError> {
         let timeout_duration = Duration::from_secs_f64(timeout_sec.max(0.0));
         let mut notification_receiver = self.list_modification_notifier.subscribe();
@@ -1091,7 +1126,81 @@ impl CalodShard {
         }
     }
 
+    // Vectorized batch operations for high throughput
+    #[cfg(target_arch="x86_64")]
+    /// Experimental: vectorized multi-get using rayon parallel chunks (x86_64 only).
+    #[cfg(target_arch="x86_64")]
+    pub async fn mget_vectorized(&self, keys: &[String]) -> Vec<Option<DataType>> {
+        use rayon::{iter::ParallelIterator, slice::ParallelSlice};
+
+        const BATCH_SIZE: usize = 8;
+        let mut results = Vec::with_capacity(keys.len());
+
+        // Process in SIMD-friendly batches
+        keys.par_chunks(BATCH_SIZE).map(|chunk| {
+            chunk.iter().map(|key| {
+                self.data.get(key).map(|entry| {
+                    if entry.is_expired() { None } else { Some(entry.value.clone()) }
+                }).flatten()
+            }).collect::<Vec<_>>()
+        }).collect::<Vec<_>>()
+            .into_iter()
+            .for_each(|batch| results.extend(batch));
+
+        results
+    }
+
+    /// Needle in a haystack problem - SIMD string comparison for patttern matching
+    #[cfg(target_arch="x86_64")]
+    unsafe fn simd_string_contains(haystack: &str, needle: &str) -> bool {
+        use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8};
+
+        if needle.len() > haystack.len() || needle.is_empty() {
+            return false;
+        }
+
+        let haystack_bytes = haystack.as_bytes();
+        let needle_bytes = needle.as_bytes();
+
+        if needle.len() >= 16 {
+            // Use AVX2 for longer patterns
+            let needle_chunk = _mm256_loadu_si256(needle_bytes.as_ptr() as *const __m256i);
+            for i in 0..=(haystack_bytes.len() - 16) {
+                let haystack_chunk = _mm256_loadu_si256(haystack_bytes[i..].as_ptr() as *const __m256i);
+                let cmp = _mm256_cmpeq_epi8(needle_chunk, haystack_chunk);
+                if _mm256_movemask_epi8(cmp) != 0 {
+                    return true;
+                }
+            }
+        }
+
+        // Fallback to standard search
+        haystack.contains(needle)
+    }
+
+    /// Vecotrized keys pattern matching
+    /// Vectorized KEYS optimization (uses SIMD substring when available); best-effort.
+    pub async fn keys_vectorized(&self, pattern: &str) -> Vec<String> {
+        self.data.iter().filter_map(|entry| {
+            let key = entry.key();
+            if !entry.value().is_expired() {
+                #[cfg(target_arch="x86_64")]
+                unsafe {
+                    if Self::simd_string_contains(key, pattern) {
+                        return Some(key.clone());
+                    }
+                }
+                #[cfg(not(target_arch="x86_64"))]
+                if key.contains(pattern) {
+                    return Some(key.clone());
+                }
+            }
+            None
+        }).collect()
+    }
+
     // --- JSON Command Handlers ---
+    /// Command: JSON.SET – Set JSON value at JSONPath.
     pub async fn json_set_cmd(&self, key: String, path: String, value_str: String) -> Result<DataType, CacheError> {
         let mut entry_mut = self.data.entry(key.clone()).or_insert_with(|| CacheEntry::new(DataType::Document(JsonValue::Null), None));
         let entry = entry_mut.value_mut();
@@ -1102,12 +1211,13 @@ impl CalodShard {
             let result_json = jsonpath_set(doc, &path, json_value)?;
             entry.value = DataType::Document(result_json);
             self.touch_key(&key).await;
-            Ok(DataType::String("OK".to_string()))
+            Ok(DataType::String(OK_RESPONSE.to_string()))
         } else {
             Err(CacheError::DataTypeMismatch(key, "Document".to_string(), entry.value.data_type()))
         }
     }
 
+    /// Command: JSON.GET – Get JSON sub-value by path.
     pub async fn json_get_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
         match self.get(&key).await? {
             DataType::Document(doc) => {
@@ -1119,6 +1229,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: JSON.DEL – Delete JSON path returning number removed.
     pub async fn json_del_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -1132,6 +1243,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: JSON.TYPE – Return type string for JSON path.
     pub async fn json_type_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
         match self.get(&key).await? {
             DataType::Document(doc) => {
@@ -1143,6 +1255,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: JSON.NUMINCRBY – Numeric add at JSON path.
     pub async fn json_numincrby_cmd(&self, key: String, path: String, increment: f64) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -1157,6 +1270,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: JSON.STRAPPEND – Append to JSON string.
     pub async fn json_strappend_cmd(&self, key: String, path: String, value: String) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -1171,6 +1285,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: JSON.ARRAPPEND – Append elements to JSON array path.
     pub async fn json_arrappend_cmd(&self, key: String, path: String, values: Vec<String>) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -1188,6 +1303,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: JSON.OBJSET – Set object field at path.
     pub async fn json_objset_cmd(&self, key: String, path: String, key_to_set: String, value: String) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -1203,6 +1319,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: JSON.OBJKEYS – List keys at object path.
     pub async fn json_objkeys_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
         match self.get(&key).await? {
             DataType::Document(doc) => {
@@ -1214,6 +1331,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: JSON.OBJLEN – Number of keys at object path.
     pub async fn json_objlen_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
         match self.get(&key).await? {
             DataType::Document(doc) => {
@@ -1225,6 +1343,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: JSON.ARRINDEX – Find index of value (optionally within range).
     pub async fn json_arrindex_cmd(&self, key: String, path: String, value: String, range: Option<(isize, isize)>) -> Result<DataType, CacheError> {
         match self.get(&key).await? {
             DataType::Document(doc) => {
@@ -1237,6 +1356,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: JSON.ARRINSERT – Insert into JSON array at index.
     pub async fn json_arrinsert_cmd(&self, key: String, path: String, index: isize, values: Vec<String>) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -1254,6 +1374,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: JSON.ARRLEN – Length of JSON array at path.
     pub async fn json_arrlen_cmd(&self, key: String, path: String) -> Result<DataType, CacheError> {
         match self.get(&key).await? {
             DataType::Document(doc) => {
@@ -1265,6 +1386,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: JSON.ARRPOP – Pop element from JSON array path (optional index).
     pub async fn json_arrpop_cmd(&self, key: String, path: String, index: Option<isize>) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -1279,6 +1401,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: JSON.ARRTRIM – Trim JSON array.
     pub async fn json_arrtrim_cmd(&self, key: String, path: String, start: isize, stop: isize) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -1294,6 +1417,7 @@ impl CalodShard {
     }
 
     // --- Graph Commands ---
+    /// Command: GRAPH.CREATE_NODE – Create a node with optional properties.
     pub async fn graph_create_node_cmd(&self, key: String, node_id: String, properties: Vec<(String, String)>) -> Result<DataType, CacheError> {
         let mut entry_mut = self.data.entry(key.clone()).or_insert_with(|| CacheEntry::new(DataType::Graph(GraphData::new()), None));
         let entry = entry_mut.value_mut();
@@ -1309,12 +1433,13 @@ impl CalodShard {
             }
             graph_data.add_node(node);
             self.touch_key(&key).await;
-            Ok(DataType::String("OK".to_string()))
+            Ok(DataType::String(OK_RESPONSE.to_string()))
         } else {
             Err(CacheError::DataTypeMismatch(key, "Graph".to_string(), entry.value.data_type()))
         }
     }
 
+    /// Command: GRAPH.GET_NODE – Fetch a node by id as JSON doc.
     pub async fn graph_get_node_cmd(&self, key: String, node_id: String) -> Result<DataType, CacheError> {
         match self.get(&key).await? {
             DataType::Graph(graph_data) => {
@@ -1334,6 +1459,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: GRAPH.DELETE_NODE – Remove a node (and implicit edges if handled upstream).
     pub async fn graph_delete_node_cmd(&self, key: String, node_id: String) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -1351,6 +1477,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: GRAPH.CREATE_EDGE – Create an edge with properties.
     pub async fn graph_create_edge_cmd(&self, key: String, edge_id: String, source_node_id: String, traget_node_id: String, relation_type: String, properties: Vec<(String, String)>) -> Result<DataType, CacheError> {
         let mut entry_mut = self.data.entry(key.clone()).or_insert_with(||CacheEntry::new(DataType::Graph(GraphData::new()), None));
         let entry = entry_mut.value_mut();
@@ -1374,13 +1501,14 @@ impl CalodShard {
             }
             graph_data.add_edge(edge);
             self.touch_key(&key).await;
-            Ok(DataType::String("OK".to_string()))
+            Ok(DataType::String(OK_RESPONSE.to_string()))
         } else {
             Err(CacheError::DataTypeMismatch(key, "Graph".to_string(), entry.value.data_type()))
         }
     }
 
 
+    /// Command: GRAPH.GET_EDGE – Fetch edge as JSON document.
     pub async fn graph_get_edge_cmd(&self, key: String, edge_id: String) -> Result<DataType, CacheError> {
         match self.get(&key).await? {
             DataType::Graph(graph_data) => {
@@ -1404,6 +1532,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: GRAPH.DELETE_EDGE – Remove edge by id.
     pub async fn graph_delete_edge_cmd(&self, key: String, edge_id: String) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -1421,6 +1550,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: GRAPH.GET_NODE_PROPERTIES – Return node properties only.
     pub async fn graph_get_node_properties_cmd(&self, key: String, node_id: String) -> Result<DataType, CacheError> {
         match self.get(&key).await? {
             DataType::Graph(graph_data) => {
@@ -1438,6 +1568,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: GRAPH.SET_NODE_PROPERTY – Upsert single property on node.
     pub async fn graph_set_node_property_cmd(&self, key: String, node_id: String, property_key: String, property_value: String) -> Result<DataType, CacheError>  {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -1447,7 +1578,7 @@ impl CalodShard {
                 Some(node_arc) => {
                     node_arc.set_property(property_key, property_value);
                     self.touch_key(&key).await;
-                    Ok(DataType::String("OK".to_string()))
+                    Ok(DataType::String(OK_RESPONSE.to_string()))
                 },
                 None => Err(CacheError::InvalidCommandArguments(format!("Node with ID '{}' not found in graph '{}'", node_id, key)))
             }
@@ -1456,6 +1587,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: GRAPH.DELETE_NODE_PROPERTY – Remove property from node if exists.
     pub async fn graph_delete_node_property_cmd(&self, key: String, node_id: String, property_key: String) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -1474,6 +1606,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: GRAPH.GET_EDGE_PROPERTIES – Return edge properties only.
     pub async fn graph_get_edge_properties_cmd(&self, key: String, edge_id: String) -> Result<DataType, CacheError> {
         match self.get(&key).await? {
             DataType::Graph(graph_data) => {
@@ -1491,6 +1624,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: GRAPH.SET_EDGE_PROPERTY – Upsert property on edge.
     pub async fn graph_set_edge_property_cmd(&self, key: String, edge_id: String, property_key: String, property_value: String) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -1500,7 +1634,7 @@ impl CalodShard {
                 Some(edge_arc) => {
                     edge_arc.set_property(property_key, property_value);
                     self.touch_key(&key).await;
-                    Ok(DataType::String("OK".to_string())) // GRAPH.SET_EDGE_PROPERTY returns OK Simple String
+                    Ok(DataType::String(OK_RESPONSE.to_string())) // GRAPH.SET_EDGE_PROPERTY returns OK Simple String
                 },
                 None => Err(CacheError::InvalidCommandArguments(format!("Edge with ID '{}' not found in graph '{}'", edge_id, key))) // Edge not found is an error
             }
@@ -1509,6 +1643,7 @@ impl CalodShard {
         }
     }
 
+    /// Command: GRAPH.DELETE_EDGE_PROPERTY – Remove edge property if exists.
     pub async fn graph_delete_edge_property_cmd(&self, key: String, edge_id: String, property_key: String) -> Result<DataType, CacheError> {
         let mut entry_writer = self.data.get_mut(&key).ok_or_else(|| CacheError::KeyNotFound(key.to_string()))?;
         let entry = entry_writer.value_mut();
@@ -1527,54 +1662,87 @@ impl CalodShard {
         }
     }
 
+    #[inline]
+    /// Mark key hash as recently used in LRU (best effort, non-blocking on contention).
+    pub async fn touch_key_with_hash(&self, key_hash: u64) {
+        if let Ok(mut lru) = self.lru_cache.try_write() {
+            lru.put(key_hash, ());
+        }
+    }
+
     /// Touch a key in the LRU (mark as recently used)
     #[inline]
     pub async fn touch_key(&self, key: &str) {
-        let segment_idx = self.get_lru_segment(key);
-        let key = key.to_string();
-
-        let mut lru = self.lru_segments[segment_idx].write().unwrap();
-
-        if let Some(pos) = lru.iter().position(|k| k == &key) {
-            lru.remove(pos);
-        }
-        lru.push_front(key);
+        let mut hasher = ahash::AHasher::default();
+        key.hash(&mut hasher);
+        let hash = hasher.finish();
+        self.touch_key_with_hash(hash).await;
     }
+
+    #[inline]
+    /// Remove a specific key hash from the LRU (used post-eviction / deletion).
+    pub async fn remove_from_lru_with_hash(&self, key_hash: u64) {
+        if let Ok(mut lru) = self.lru_cache.try_write() {
+            lru.pop(&key_hash);
+        }
+    } 
 
     /// Remove a key from the LRU
     #[inline]
     pub async fn remove_from_lru(&self, key: &str) {
-        let segment_idx = self.get_lru_segment(key);
-        let mut lru = self.lru_segments[segment_idx].write().unwrap();
-
-        if let Some(pos) = lru.iter().position(|k| k == key) {
-            lru.remove(pos);
-        }
+        let mut hasher = ahash::AHasher::default();
+        key.hash(&mut hasher);
+        let hash = hasher.finish();
+        self.remove_from_lru_with_hash(hash).await;
     }
 
+    /// Perform eviction when over capacity using candidate ranking.
     pub async fn evict(&self) {
-        // let mut candidates = BinaryHeap::new();
+        use std::collections::BinaryHeap;
 
-        // for key in lru.iter().rev().take(5) {
-        //     if let Some(entry) = self.data.get(key) {
-        //         let score = entry.eviction_score();
-        //         candidates.push(EvictionCandidate {
-        //             key: key.clone(),
-        //             score,
-        //         });
-        //     }
-        // }
+        let target_size = (self.capacity.load(Ordering::Relaxed) as f64 * 0.8) as usize;
+    let current_size = self.size.load(Ordering::Relaxed);
+    if current_size <= target_size { return; }
 
-        // if let Some(candidate) = candidates.pop() {
-        //     if self.data.remove(&candidate.key).is_some() {
-        //         self.size.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        //     }
-        // }
+    let mut candidates = BinaryHeap::new();
+        const MAX_CANDIDATES: usize = 50;
+
+        if let Ok(lru) = self.lru_cache.try_read() {
+            let iter = lru.iter().rev();
+            for (key_hash, _) in iter.take(MAX_CANDIDATES) {
+                // Find the actual key for this hash
+                for entry_ref in self.data.iter() {
+                    let mut hasher = ahash::AHasher::default();
+                    entry_ref.key().hash(&mut hasher);
+                    if hasher.finish() == *key_hash {
+                        let score = entry_ref.value().eviction_score();
+                        candidates.push(EvictionCandidate {
+                            key: entry_ref.key().clone(),
+                            score,
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Evict entries until we reach target size (re-evaluating size each iteration)
+        while self.size.load(Ordering::Relaxed) > target_size && !candidates.is_empty() {
+            if let Some(candidate) = candidates.pop() {
+                if let Some((_, entry)) = self.data.remove(&candidate.key) {
+                    let entry_size = entry.size();
+                    self.size.fetch_sub(1,Ordering::Relaxed);
+                    self.metrics.total_data_size.fetch_sub(entry_size as u64, Ordering::Relaxed);
+                    self.remove_from_lru(&candidate.key).await;
+                }
+            }
+        }
     }
 }
 
 
-impl CalodShard {    
+impl CalodShard {   
+    /// Persist this shard's in-memory dataset to a binary snapshot at `path`.
     pub async fn save(&self, path: &str) -> Result<(), PersistenceError> {
         let data = self.data.iter().map(|entry| (entry.key().clone(), entry.value().clone())).collect::<Vec<_>>();
 
@@ -1585,6 +1753,8 @@ impl CalodShard {
         Ok(())
     }
 
+    /// Load a snapshot from `path`, replacing (merging over) existing keys.
+    /// Duplicate keys in the snapshot overwrite current values.
     pub async fn load(&self, path: &str) -> Result<(), PersistenceError> {
         let encoded = read(path).await.map_err(PersistenceError::Io)?;
         let data: Vec<(String, CacheEntry)> = deserialize(&encoded).map_err(PersistenceError::Serialization)?;
