@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use argon2::password_hash::rand_core::OsRng;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
 use dashmap::DashMap;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use tracing::info;
@@ -48,7 +48,15 @@ impl AuthManager {
             return;
         }
 
-        let salt = SaltString::generate(&mut OsRng);
+        let mut salt_bytes = [0u8; 16];
+        rand::rng().fill_bytes(&mut salt_bytes);
+        let salt = match SaltString::encode_b64(&salt_bytes) {
+            Ok(salt) => salt,
+            Err(err) => {
+                info!("failed to generate salt: {}", err);
+                return;
+            }
+        };
         let password_hash = match self.argon2.hash_password(password.as_bytes(), &salt) {
             Ok(hash) => hash.to_string(),
             Err(err) => {

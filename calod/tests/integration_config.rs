@@ -137,8 +137,27 @@ async fn info_advertises_redis_version_and_run_id() {
         info.contains("redis_version:7.4.0"),
         "INFO must advertise a redis_version clients can gate on"
     );
+    assert!(
+        info.contains(&format!("calod_version:{}", env!("CARGO_PKG_VERSION"))),
+        "INFO must report the real calod crate version"
+    );
     assert!(info.contains("run_id:"));
     assert!(info.contains("maxmemory:"));
+
+    // Server identity fields must be honest, not placeholders.
+    assert!(
+        info.contains("allocator:mimalloc"),
+        "INFO must report the actual global allocator (mimalloc)"
+    );
+    assert!(
+        !info.contains("process_id:0\r\n"),
+        "INFO must report the real process id"
+    );
+    assert!(!info.contains("os:unknown"), "INFO must report the real OS");
+    assert!(
+        !info.contains("executable:/path/to/calod"),
+        "INFO must report the real executable path"
+    );
 
     server.shutdown().await;
 }

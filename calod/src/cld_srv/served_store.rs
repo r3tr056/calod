@@ -2974,17 +2974,24 @@ impl ServedCalodStore {
             report.push_str("# Server\r\n");
             // Many clients gate feature availability on `redis_version`.
             report.push_str("redis_version:7.4.0\r\n");
-            report.push_str("calod_version:1.0.0\r\n");
+            report.push_str(&format!("calod_version:{}\r\n", env!("CARGO_PKG_VERSION")));
             report.push_str("redis_mode:standalone\r\n");
             report.push_str(&format!("run_id:{}\r\n", self.run_id));
             report.push_str(&format!("tcp_port:{}\r\n", cfg.listen_addr.port()));
             report.push_str(&format!("uptime_in_seconds:{uptime_secs}\r\n"));
             report.push_str(&format!("uptime_in_days:{}\r\n", uptime_secs / 86400));
             report.push_str("hz:10\r\n");
-            report.push_str("os:unknown\r\n");
+            report.push_str(&format!(
+                "os:{} {}\r\n",
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ));
             report.push_str("arch_bits:64\r\n");
-            report.push_str("process_id:0\r\n");
-            report.push_str("executable:/path/to/calod\r\n");
+            report.push_str(&format!("process_id:{}\r\n", std::process::id()));
+            let executable = std::env::current_exe()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            report.push_str(&format!("executable:{executable}\r\n"));
             report.push_str("config_file:\r\n");
             report.push_str("\r\n");
         }
@@ -3037,7 +3044,7 @@ impl ServedCalodStore {
                 human_bytes(maxmemory.parse().unwrap_or(0))
             ));
             report.push_str(&format!("maxmemory_policy:{maxmemory_policy}\r\n"));
-            report.push_str("allocator:jemalloc\r\n");
+            report.push_str("allocator:mimalloc\r\n");
             report.push_str("active_defrag_running:0\r\n");
             report.push_str("lazyfree_pending_objects:0\r\n");
             report.push_str("\r\n");
