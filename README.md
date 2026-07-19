@@ -1,7 +1,7 @@
 
 # Calod: Superfast, AI-Ready Data Store 🚀
 
-[![Project Status](https://img.shields.io/badge/status-beta-yellow)](https://github.com/r3tr056/calod) [![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE) [![Benchmarks](https://img.shields.io/badge/Benchmarks-Coming%20Soon-orange)](BENCHMARKS.md)
+[![Project Status](https://img.shields.io/badge/status-beta-yellow)](https://github.com/r3tr056/calod) [![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE) [![Benchmarks](https://img.shields.io/badge/Benchmarks-harness%20ready-orange)](calod/scripts/benchmark/README.md)
 
 ![Calod Logo Placeholder](https://github.com/r3tr056/calod/blob/dev/.github/images/logo.jpeg?raw=true) <!-- Replace with your actual logo image -->
 
@@ -141,13 +141,11 @@ print(f"Updated Features: {updated_features.decode('utf-8')}")
 
 ## 📊 Performance Benchmarks
 
-[BENCHMARKS.md](BENCHMARKS.md)
+No benchmark numbers are published yet — the measurement harness is built in milestone M0 and results will be published once they exist. No fake numbers, ever.
 
-Docker-based stress testing instructions live in [`calod/docs/stress-testing.md`](calod/docs/stress-testing.md).
-
-**Performance benchmarks are currently being finalized and will be available soon.** We are targeting significant performance improvements over existing solutions.  We will showcase benchmarks comparing Calod against Redis and other data stores under various workloads.
-
-**[Coming Soon: Link to detailed benchmark results and methodology]**
+- Benchmark methodology and runner (calod vs Redis 7.4 vs Valkey 8 at equal cores, memtier_benchmark): [`calod/scripts/benchmark/README.md`](calod/scripts/benchmark/README.md)
+- Redis tcl-suite parity runner: [`calod/scripts/tcl-suite/README.md`](calod/scripts/tcl-suite/README.md)
+- Python stress-workload driver (docker-based): [`calod/scripts/stress_runner.py`](calod/scripts/stress_runner.py), invoked via [`calod/scripts/run-stress.sh`](calod/scripts/run-stress.sh)
 
 ## 🗺️ Roadmap
 

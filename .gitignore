@@ -27,3 +27,7 @@ calod/stress-artifacts/
 # vendored reference clone (untracked)
 redis-rs/
 .superpowers/
+
+# Benchmark + tcl-suite run artifacts
+calod/benchmark-results/
+calod/tcl-results/
