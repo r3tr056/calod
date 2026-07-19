@@ -1,0 +1,10 @@
+target
+.git
+.github
+stress-artifacts
+data
+docker-compose*.override.yml
+scripts/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.rs.bk

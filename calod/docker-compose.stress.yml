@@ -1,0 +1,83 @@
+services:
+  calod:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: calod-stress-server:local
+    command: ["--address", "0.0.0.0", "--port", "6379"]
+    ports:
+      - "${CALOD_HOST_PORT:-6379}:6379"
+    mem_limit: ${CALOD_SERVER_MEM_LIMIT:-6g}
+    cpus: ${CALOD_SERVER_CPUS:-4}
+    healthcheck:
+      test: ["CMD-SHELL", "printf '*1\\r\\n$4\\r\\nPING\\r\\n' | nc -w 1 127.0.0.1 6379 | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+    restart: "no"
+
+  redis-baseline:
+    image: redis:7.2-bookworm
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--protected-mode", "no"]
+    profiles: ["redis"]
+    ports:
+      - "${REDIS_BASELINE_HOST_PORT:-6380}:6379"
+    mem_limit: ${CALOD_SERVER_MEM_LIMIT:-6g}
+    cpus: ${CALOD_SERVER_CPUS:-4}
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    restart: "no"
+
+  stress-runner:
+    build:
+      context: .
+      dockerfile: docker/stress-runner/Dockerfile
+    image: calod-stress-runner:local
+    depends_on:
+      calod:
+        condition: service_healthy
+    environment:
+      STRESS_TARGET_NAME: calod
+      REDIS_HOST: calod
+      REDIS_PORT: "6379"
+      STRESS_PROFILE: ${STRESS_PROFILE:-A}
+      STRESS_DURATION_SECS: ${STRESS_DURATION_SECS:-}
+      STRESS_CONCURRENCY: ${STRESS_CONCURRENCY:-}
+      STRESS_KEY_COUNT: ${STRESS_KEY_COUNT:-}
+      STRESS_REPEAT_RUNS: ${STRESS_REPEAT_RUNS:-}
+      STRESS_ARTIFACT_PATH: /artifacts/${STRESS_PROFILE:-A}-calod-results.json
+    volumes:
+      - ./stress-artifacts:/artifacts
+    mem_limit: ${CALOD_RUNNER_MEM_LIMIT:-1g}
+    cpus: ${CALOD_RUNNER_CPUS:-2}
+    restart: "no"
+
+  stress-runner-redis:
+    build:
+      context: .
+      dockerfile: docker/stress-runner/Dockerfile
+    image: calod-stress-runner:local
+    profiles: ["redis"]
+    depends_on:
+      redis-baseline:
+        condition: service_healthy
+    environment:
+      STRESS_TARGET_NAME: redis
+      REDIS_HOST: redis-baseline
+      REDIS_PORT: "6379"
+      STRESS_PROFILE: ${STRESS_PROFILE:-A}
+      STRESS_DURATION_SECS: ${STRESS_DURATION_SECS:-}
+      STRESS_CONCURRENCY: ${STRESS_CONCURRENCY:-}
+      STRESS_KEY_COUNT: ${STRESS_KEY_COUNT:-}
+      STRESS_REPEAT_RUNS: ${STRESS_REPEAT_RUNS:-}
+      STRESS_ARTIFACT_PATH: /artifacts/${STRESS_PROFILE:-A}-redis-results.json
+    volumes:
+      - ./stress-artifacts:/artifacts
+    mem_limit: ${CALOD_RUNNER_MEM_LIMIT:-1g}
+    cpus: ${CALOD_RUNNER_CPUS:-2}
+    restart: "no"

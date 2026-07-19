@@ -1,8 +1,7 @@
-use serde_json::{Value as JsonValue, json, Number as JsonNumber, Map as JsonMap};
+use serde_json::{json, Map as JsonMap, Number as JsonNumber, Value as JsonValue};
 use std::cmp;
 
 use crate::store::error::CacheError;
-
 
 pub fn json_type_to_string(json_value: &JsonValue) -> String {
     match json_value {
@@ -11,7 +10,7 @@ pub fn json_type_to_string(json_value: &JsonValue) -> String {
         JsonValue::Number(_) => "number".to_string(),
         JsonValue::String(_) => "string".to_string(),
         JsonValue::Array(_) => "array".to_string(),
-        JsonValue::Object(_) => "object".to_string(), 
+        JsonValue::Object(_) => "object".to_string(),
     }
 }
 
@@ -61,12 +60,16 @@ fn parse_json_path(path: &str) -> Result<Vec<PathSegment>, CacheError> {
             s = &s[1..];
             let mut idx_str = String::new();
             for c in s.chars() {
-                if c == ']' { break; }
+                if c == ']' {
+                    break;
+                }
                 idx_str.push(c);
             }
 
             if !s.starts_with(&idx_str) || !s[idx_str.len()..].starts_with(']') {
-                return Err(CacheError::InvalidCommandArguments("Missing closing bracket in JSONPath".to_string()));
+                return Err(CacheError::InvalidCommandArguments(
+                    "Missing closing bracket in JSONPath".to_string(),
+                ));
             }
 
             s = &s[idx_str.len() + 1..];
@@ -101,36 +104,43 @@ fn traverse_path<'a>(doc: &'a JsonValue, segments: &[PathSegment]) -> Option<&'a
                 } else {
                     return None;
                 }
-            },
+            }
         }
     }
     Some(current)
 }
 
-fn traverse_path_mut<'a>(doc: &'a mut JsonValue, segments: &[PathSegment]) -> Result<&'a mut JsonValue, CacheError> {
+fn traverse_path_mut<'a>(
+    doc: &'a mut JsonValue,
+    segments: &[PathSegment],
+) -> Result<&'a mut JsonValue, CacheError> {
     if segments.is_empty() {
         return Ok(doc);
     }
 
     let mut current = doc;
-    for i in 0..(segments.len() - 1) {
-        let seg = &segments[i];
-        let next_seg = &segments[i + 1];
+    for (i, seg) in segments.iter().enumerate() {
+        let next_seg = segments.get(i + 1);
         match seg {
             PathSegment::Key(ref key) => {
                 if !current.is_object() {
                     if current.is_null() {
                         *current = JsonValue::Object(JsonMap::new());
                     } else {
-                        return Err(CacheError::DataTypeMismatch(key.clone(), "object".to_string(), json_type_to_string(current)));
+                        return Err(CacheError::DataTypeMismatch(
+                            key.clone(),
+                            "object".to_string(),
+                            json_type_to_string(current),
+                        ));
                     }
                 }
 
                 let obj = current.as_object_mut().unwrap();
                 if !obj.contains_key(key) {
                     let new_val = match next_seg {
-                        PathSegment::Key(_) => JsonValue::Object(JsonMap::new()),
-                        PathSegment::Index(_) => JsonValue::Array(vec![]),
+                        Some(PathSegment::Key(_)) => JsonValue::Object(JsonMap::new()),
+                        Some(PathSegment::Index(_)) => JsonValue::Array(vec![]),
+                        None => JsonValue::Object(JsonMap::new()),
                     };
                     obj.insert(key.clone(), new_val);
                 }
@@ -155,7 +165,7 @@ fn traverse_path_mut<'a>(doc: &'a mut JsonValue, segments: &[PathSegment]) -> Re
                     arr.push(JsonValue::Null);
                 }
                 current = &mut arr[*idx];
-            },
+            }
         }
     }
 
@@ -163,19 +173,31 @@ fn traverse_path_mut<'a>(doc: &'a mut JsonValue, segments: &[PathSegment]) -> Re
 }
 
 // for operations that modify a sub-value
-fn get_parent_mut<'a>(doc: &'a mut JsonValue, segments: &[PathSegment]) -> Result<(&'a mut JsonValue, PathSegment), CacheError> {
+fn get_parent_mut<'a>(
+    doc: &'a mut JsonValue,
+    segments: &[PathSegment],
+) -> Result<(&'a mut JsonValue, PathSegment), CacheError> {
     if segments.is_empty() {
-        return Err(CacheError::InvalidCommandArguments("Cannot operate on root element".to_string()));
+        return Err(CacheError::InvalidCommandArguments(
+            "Cannot operate on root element".to_string(),
+        ));
     }
     let parent_segments = &segments[..segments.len() - 1];
-    let last_segment = segments.last().unwrap().clone();
+    let last_segment = segments
+        .last()
+        .cloned()
+        .ok_or_else(|| CacheError::InvalidCommandArguments("Invalid JSONPath".to_string()))?;
     let parent = traverse_path_mut(doc, parent_segments)?;
     Ok((parent, last_segment))
 }
 
 // Sets the value at the given JSONPath, creating any missing intermediate nodes.
 // If the path is empty, replaces the entire document.
-pub fn jsonpath_set(doc: &mut JsonValue, path: &str, value: JsonValue) -> Result<JsonValue, CacheError> {
+pub fn jsonpath_set(
+    doc: &mut JsonValue,
+    path: &str,
+    value: JsonValue,
+) -> Result<JsonValue, CacheError> {
     let segments = parse_json_path(path)?;
     if segments.is_empty() {
         *doc = value;
@@ -186,7 +208,11 @@ pub fn jsonpath_set(doc: &mut JsonValue, path: &str, value: JsonValue) -> Result
     match last_seg {
         PathSegment::Index(idx) => {
             if !parent.is_array() {
-                return Err(CacheError::DataTypeMismatch(idx.to_string(), "array".to_string(), json_type_to_string(&parent)));
+                return Err(CacheError::DataTypeMismatch(
+                    idx.to_string(),
+                    "array".to_string(),
+                    json_type_to_string(parent),
+                ));
             }
             let arr = parent.as_array_mut().unwrap();
             if idx < arr.len() {
@@ -194,7 +220,10 @@ pub fn jsonpath_set(doc: &mut JsonValue, path: &str, value: JsonValue) -> Result
             } else if idx == arr.len() {
                 arr.push(value);
             } else {
-                return Err(CacheError::InvalidCommandArguments(format!("Index {} out of bounds", idx)));
+                return Err(CacheError::InvalidCommandArguments(format!(
+                    "Index {} out of bounds",
+                    idx
+                )));
             }
         }
         PathSegment::Key(key) => {
@@ -209,7 +238,10 @@ pub fn jsonpath_set(doc: &mut JsonValue, path: &str, value: JsonValue) -> Result
         }
     }
 
-    Ok(traverse_path(doc, &segments).unwrap().clone())
+    let result = traverse_path(doc, &segments).cloned().ok_or_else(|| {
+        CacheError::InternalError("Failed to resolve JSONPath after set".to_string())
+    })?;
+    Ok(result)
 }
 
 // Gets the value at the given JSONPath. Returns Null if not found.
@@ -233,9 +265,13 @@ pub fn jsonpath_del(doc: &mut JsonValue, path: &str) -> Result<usize, CacheError
             if let JsonValue::Object(map) = parent {
                 Ok(map.remove(&key).map(|_| 1).unwrap_or(0))
             } else {
-                Err(CacheError::DataTypeMismatch(key, "object".to_string(), json_type_to_string(&parent)))
+                Err(CacheError::DataTypeMismatch(
+                    key,
+                    "object".to_string(),
+                    json_type_to_string(parent),
+                ))
             }
-        },
+        }
         PathSegment::Index(idx) => {
             if let JsonValue::Array(arr) = parent {
                 if idx < arr.len() {
@@ -245,15 +281,23 @@ pub fn jsonpath_del(doc: &mut JsonValue, path: &str) -> Result<usize, CacheError
                     Ok(0)
                 }
             } else {
-                Err(CacheError::DataTypeMismatch(idx.to_string(), "array".to_string(), json_type_to_string(&parent)))
+                Err(CacheError::DataTypeMismatch(
+                    idx.to_string(),
+                    "array".to_string(),
+                    json_type_to_string(parent),
+                ))
             }
-        },
+        }
     }
 }
 
 // Increments the number stored at the JSONPath by a given increment.
 // If the current value is an integer, the result is truncated to an integer
-pub fn jsonpath_numincrby(doc: &mut JsonValue, path: &str, increment: f64) -> Result<JsonValue, CacheError> {
+pub fn jsonpath_numincrby(
+    doc: &mut JsonValue,
+    path: &str,
+    increment: f64,
+) -> Result<JsonValue, CacheError> {
     let segments = parse_json_path(path)?;
     let current_val = traverse_path(doc, &segments)
         .ok_or_else(|| {
@@ -262,15 +306,22 @@ pub fn jsonpath_numincrby(doc: &mut JsonValue, path: &str, increment: f64) -> Re
         .clone();
 
     if !current_val.is_number() {
-        return Err(CacheError::InvalidCommandArguments(format!("Value at the path is not a number: {}", path)));
+        return Err(CacheError::InvalidCommandArguments(format!(
+            "Value at the path is not a number: {}",
+            path
+        )));
     }
-    
+
     let new_val = if let Some(n) = current_val.as_f64() {
         let updated = n + increment;
         if current_val.is_i64() || current_val.is_u64() {
             JsonValue::Number(JsonNumber::from(updated.trunc() as i64))
         } else {
-            JsonNumber::from_f64(updated).map(JsonValue::Number).ok_or_else(|| { CacheError::InternalError("Failed to convert incremented value".to_string()) })?
+            JsonNumber::from_f64(updated)
+                .map(JsonValue::Number)
+                .ok_or_else(|| {
+                    CacheError::InternalError("Failed to convert incremented value".to_string())
+                })?
         }
     } else {
         return Err(CacheError::InvalidCommandArguments(format!(
@@ -284,49 +335,95 @@ pub fn jsonpath_numincrby(doc: &mut JsonValue, path: &str, increment: f64) -> Re
 }
 
 // Appends the given string to the string at the JSONPath
-pub fn jsonpath_strappend(doc: &mut JsonValue, path: &str, value_to_append: &str) -> Result<JsonValue, CacheError> {
+pub fn jsonpath_strappend(
+    doc: &mut JsonValue,
+    path: &str,
+    value_to_append: &str,
+) -> Result<JsonValue, CacheError> {
     let segments = parse_json_path(path)?;
     let current_val = traverse_path(doc, &segments).ok_or_else(|| {
         CacheError::InvalidCommandArguments(format!("JSONPath not found: {}", path))
     })?;
 
     if !current_val.is_string() {
-        return Err(CacheError::InvalidCommandArguments(format!("Value at path is not a string for STRAPPEND: {}", path)));
+        return Err(CacheError::InvalidCommandArguments(format!(
+            "Value at path is not a string for STRAPPEND: {}",
+            path
+        )));
     }
 
-    let mut new_str = current_val.as_str().unwrap().to_owned();
+    let mut new_str = current_val
+        .as_str()
+        .ok_or_else(|| {
+            CacheError::InvalidCommandArguments(format!("Value at path is not string: {}", path))
+        })?
+        .to_owned();
     new_str.push_str(value_to_append);
     jsonpath_set(doc, path, json!(new_str))
 }
 
 // Appends the given values to the array to the JSONPath. If the current value is
 // null, it is treated as an empty array
-pub fn jsonpath_arrappend(doc: &mut JsonValue, path: &str, values_to_append: &Vec<JsonValue>) -> Result<JsonValue, CacheError> {
+pub fn jsonpath_arrappend(
+    doc: &mut JsonValue,
+    path: &str,
+    values_to_append: &[JsonValue],
+) -> Result<JsonValue, CacheError> {
     let segments = parse_json_path(path)?;
-    let current_val = traverse_path(doc, &segments).cloned().unwrap_or(JsonValue::Null);
+    let current_val = traverse_path(doc, &segments)
+        .cloned()
+        .unwrap_or(JsonValue::Null);
     let mut new_arr = if current_val.is_array() {
-        current_val.as_array().unwrap().clone()
+        current_val
+            .as_array()
+            .ok_or_else(|| {
+                CacheError::InvalidCommandArguments(format!("Value at path is not array: {}", path))
+            })?
+            .clone()
     } else if current_val.is_null() {
         vec![]
     } else {
-        return Err(CacheError::DataTypeMismatch(path.to_string(), "Array or Null".to_string(), json_type_to_string(&current_val)));
+        return Err(CacheError::DataTypeMismatch(
+            path.to_string(),
+            "Array or Null".to_string(),
+            json_type_to_string(&current_val),
+        ));
     };
 
-    new_arr.extend(values_to_append.clone());
+    new_arr.extend_from_slice(values_to_append);
     jsonpath_set(doc, path, json!(new_arr))
 }
 
 // Sets the given key to a value in the object at the JSONPath
 // If the current value is null, it is treated as an empty object
-pub fn jsonpath_objset(doc: &mut JsonValue, path: &str, key_to_set: &str, value_to_set: JsonValue) -> Result<JsonValue, CacheError> {
+pub fn jsonpath_objset(
+    doc: &mut JsonValue,
+    path: &str,
+    key_to_set: &str,
+    value_to_set: JsonValue,
+) -> Result<JsonValue, CacheError> {
     let segments = parse_json_path(path)?;
-    let current_val = traverse_path(doc, &segments).cloned().unwrap_or(JsonValue::Null);
+    let current_val = traverse_path(doc, &segments)
+        .cloned()
+        .unwrap_or(JsonValue::Null);
     let mut new_obj = if current_val.is_object() {
-        current_val.as_object().unwrap().clone()
+        current_val
+            .as_object()
+            .ok_or_else(|| {
+                CacheError::InvalidCommandArguments(format!(
+                    "Value at path is not object: {}",
+                    path
+                ))
+            })?
+            .clone()
     } else if current_val.is_null() {
         JsonMap::new()
     } else {
-        return Err(CacheError::DataTypeMismatch(path.to_string(), "Object or Null".to_string(), json_type_to_string(&current_val)));
+        return Err(CacheError::DataTypeMismatch(
+            path.to_string(),
+            "Object or Null".to_string(),
+            json_type_to_string(&current_val),
+        ));
     };
 
     new_obj.insert(key_to_set.to_string(), value_to_set);
@@ -343,7 +440,11 @@ pub fn jsonpath_objkeys(doc: &JsonValue, path: &str) -> Result<Vec<String>, Cach
     if let JsonValue::Object(map) = current_val {
         Ok(map.keys().cloned().collect())
     } else {
-        Err(CacheError::DataTypeMismatch(path.to_string(), "Object".to_string(), json_type_to_string(current_val)))
+        Err(CacheError::DataTypeMismatch(
+            path.to_string(),
+            "Object".to_string(),
+            json_type_to_string(current_val),
+        ))
     }
 }
 
@@ -357,13 +458,22 @@ pub fn jsonpath_objlen(doc: &JsonValue, path: &str) -> Result<usize, CacheError>
     if let JsonValue::Object(map) = current_val {
         Ok(map.len())
     } else {
-        Err(CacheError::DataTypeMismatch(path.to_string(), "Object".to_string(), json_type_to_string(current_val)))
+        Err(CacheError::DataTypeMismatch(
+            path.to_string(),
+            "Object".to_string(),
+            json_type_to_string(current_val),
+        ))
     }
 }
 
 // Searches for a value in the array at the JSONPath within an optional index range.
 // Returns the index if found, or -1 if not found.
-pub fn jsonpath_arrindex(doc: &JsonValue, path: &str, value_to_find: &JsonValue, range: Option<(isize, isize)>) -> Result<isize, CacheError> {
+pub fn jsonpath_arrindex(
+    doc: &JsonValue,
+    path: &str,
+    value_to_find: &JsonValue,
+    range: Option<(isize, isize)>,
+) -> Result<isize, CacheError> {
     let segments = parse_json_path(path)?;
     let current_val = traverse_path(doc, &segments).ok_or_else(|| {
         CacheError::InvalidCommandArguments(format!("JSONPath not found: {}", path))
@@ -391,10 +501,13 @@ pub fn jsonpath_arrindex(doc: &JsonValue, path: &str, value_to_find: &JsonValue,
         }
         Ok(-1)
     } else {
-        Err(CacheError::DataTypeMismatch(path.to_string(), "Array".to_string(), json_type_to_string(current_val)))
+        Err(CacheError::DataTypeMismatch(
+            path.to_string(),
+            "Array".to_string(),
+            json_type_to_string(current_val),
+        ))
     }
 }
-
 
 // Inserts the given values into the array at the JSONPath at the given index.
 // Negative indexes count from the end.
@@ -402,7 +515,7 @@ pub fn jsonpath_arrinsert(
     doc: &mut JsonValue,
     path: &str,
     index: isize,
-    values_to_insert: &Vec<JsonValue>,
+    values_to_insert: &[JsonValue],
 ) -> Result<JsonValue, CacheError> {
     let segments = parse_json_path(path)?;
     let current_val = traverse_path(doc, &segments).cloned().ok_or_else(|| {
@@ -410,11 +523,7 @@ pub fn jsonpath_arrinsert(
     })?;
     if let JsonValue::Array(mut arr) = current_val {
         let len = arr.len() as isize;
-        let mut insert_pos = if index < 0 {
-            index + len
-        } else {
-            index
-        };
+        let mut insert_pos = if index < 0 { index + len } else { index };
         insert_pos = cmp::max(0, cmp::min(insert_pos, len));
         // Insert values one by one.
         for (offset, val) in values_to_insert.iter().cloned().enumerate() {
@@ -511,7 +620,6 @@ pub fn jsonpath_arrtrim(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,7 +634,7 @@ mod tests {
     #[test]
     fn test_jsonpath_arrappend() {
         let mut doc = json!({ "arr": [1, 2] });
-        let _ = jsonpath_arrappend(&mut doc, "$.arr", &vec![json!(3), json!(4)]).unwrap();
+        let _ = jsonpath_arrappend(&mut doc, "$.arr", &[json!(3), json!(4)]).unwrap();
         assert_eq!(jsonpath_get(&doc, "$.arr").unwrap(), json!([1, 2, 3, 4]));
     }
 

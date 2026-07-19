@@ -1,5 +1,5 @@
-
-pub mod parser;
 pub mod errors;
-pub mod value;
+#[allow(clippy::module_inception)]
+pub mod parser;
 pub mod simd;
+pub mod value;

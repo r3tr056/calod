@@ -143,6 +143,8 @@ print(f"Updated Features: {updated_features.decode('utf-8')}")
 
 [BENCHMARKS.md](BENCHMARKS.md)
 
+Docker-based stress testing instructions live in [`calod/docs/stress-testing.md`](calod/docs/stress-testing.md).
+
 **Performance benchmarks are currently being finalized and will be available soon.** We are targeting significant performance improvements over existing solutions.  We will showcase benchmarks comparing Calod against Redis and other data stores under various workloads.
 
 **[Coming Soon: Link to detailed benchmark results and methodology]**

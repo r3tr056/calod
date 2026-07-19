@@ -1,8 +1,8 @@
+use ahash::AHasher;
+use dashmap::DashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use dashmap::DashMap;
-use ahash::AHasher;
-use std::hash::{Hash, Hasher};
 
 /// A packed directory entry describing the physical location of a value.
 /// This will later allow remote nodes (with proper authorization) to perform
@@ -42,7 +42,10 @@ pub struct Directory {
 
 impl Directory {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self { entries: DashMap::new(), publish_version: AtomicU64::new(1) })
+        Arc::new(Self {
+            entries: DashMap::new(),
+            publish_version: AtomicU64::new(1),
+        })
     }
 
     #[inline]

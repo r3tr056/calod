@@ -1,1 +1,1 @@
-pub mod fastgraph_ext;
+pub mod graph_data;

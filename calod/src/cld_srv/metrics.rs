@@ -10,6 +10,12 @@ pub struct ConnectionMetrics {
     total_execution_time_micros: AtomicU64,
 }
 
+impl Default for ConnectionMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ConnectionMetrics {
     pub fn new() -> Self {
         Self {
@@ -29,35 +35,41 @@ impl ConnectionMetrics {
     pub fn bytes_sent(&self, bytes: u64) {
         self.bytes_sent.fetch_add(bytes, Ordering::Relaxed);
     }
-    
+
     #[inline]
     pub fn command_received(&self) {
         self.commands_processed.fetch_add(1, Ordering::Relaxed);
     }
-    
+
     #[inline]
     pub fn command_executed(&self, duration: Duration) {
         let micros = duration.as_micros() as u64;
-        self.total_execution_time_micros.fetch_add(micros, Ordering::Relaxed);
+        self.total_execution_time_micros
+            .fetch_add(micros, Ordering::Relaxed);
     }
-    
+
     #[inline]
     pub fn connection_established(&self) {
         // Nothing to track at connection level
     }
-    
+
     #[inline]
     pub fn connection_closed(&self) {
         // Nothing to track at connection level
     }
-
 }
 
 /// Server-wide metrics aggregator
 pub struct MetricsAggregator {
     total_connections: AtomicU64,
     current_connections: AtomicU64,
-    total_commands: AtomicU64,
+    total_commands_processed: AtomicU64,
+}
+
+impl Default for MetricsAggregator {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MetricsAggregator {
@@ -65,33 +77,44 @@ impl MetricsAggregator {
         Self {
             total_connections: AtomicU64::new(0),
             current_connections: AtomicU64::new(0),
-            total_commands: AtomicU64::new(0),
+            total_commands_processed: AtomicU64::new(0),
         }
     }
-    
+
     #[inline]
     pub fn new_connection_metrics(&self) -> Arc<ConnectionMetrics> {
         Arc::new(ConnectionMetrics::new())
     }
-    
+
     #[inline]
     pub fn connections_total_inc(&self) {
         self.total_connections.fetch_add(1, Ordering::Relaxed);
         self.current_connections.fetch_add(1, Ordering::Relaxed);
     }
-    
+
     #[inline]
     pub fn connections_total_dec(&self) {
         self.current_connections.fetch_sub(1, Ordering::Relaxed);
     }
-    
+
     #[inline]
     pub fn get_total_connections(&self) -> u64 {
         self.total_connections.load(Ordering::Relaxed)
     }
-    
+
     #[inline]
     pub fn get_current_connections(&self) -> u64 {
         self.current_connections.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn command_processed_inc(&self) {
+        self.total_commands_processed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn get_total_commands_processed(&self) -> u64 {
+        self.total_commands_processed.load(Ordering::Relaxed)
     }
 }

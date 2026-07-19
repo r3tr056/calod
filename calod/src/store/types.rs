@@ -1,7 +1,6 @@
-
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::time::{Duration, SystemTime};
-use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ttl(pub u64);
@@ -30,7 +29,7 @@ impl Timestamp {
     pub fn now() -> Self {
         Timestamp(SystemTime::now())
     }
-    
+
     /// Get elapsed milliseconds since this timestamp
     pub fn elapsed_ms(&self) -> u64 {
         self.0

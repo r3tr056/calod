@@ -18,16 +18,18 @@ pub fn find_crlf(buf: &[u8]) -> Option<usize> {
 #[target_feature(enable = "avx2")]
 #[cfg(target_arch = "x86_64")]
 unsafe fn find_crlf_avx2(buf: &[u8]) -> Option<usize> {
-    use std::arch::x86_64::{__m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8};
+    use std::arch::x86_64::{
+        __m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
+    };
 
     let mut offset = 0;
     let len = buf.len();
 
     // Must have enough space for at least one full vector plus one extra byte for the \n
-    while offset <= len - 33 {
+    while offset + 33 <= len {
         let chunk = _mm256_loadu_si256(buf.as_ptr().add(offset) as *const __m256i);
         let cr_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, _mm256_set1_epi8(b'\r' as i8)));
-        
+
         if cr_mask != 0 {
             // Check each CR position for a following LF
             let mut bit = 1;
@@ -38,10 +40,10 @@ unsafe fn find_crlf_avx2(buf: &[u8]) -> Option<usize> {
                 bit <<= 1;
             }
         }
-        
+
         offset += 32;
     }
-    
+
     // Fall back to standard search for remaining bytes
     find_crlf_fallback(&buf[offset..]).map(|pos| offset + pos)
 }
@@ -50,16 +52,18 @@ unsafe fn find_crlf_avx2(buf: &[u8]) -> Option<usize> {
 #[target_feature(enable = "sse2")]
 #[cfg(target_arch = "x86_64")]
 unsafe fn find_crlf_sse2(buf: &[u8]) -> Option<usize> {
-    use std::arch::x86_64::{__m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8};
+    use std::arch::x86_64::{
+        __m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8,
+    };
 
     let mut offset = 0;
     let len = buf.len();
 
     // Must have enough space for at least one full vector plus one extra byte for the \n
-    while offset <= len - 17 {
+    while offset + 17 <= len {
         let chunk = _mm_loadu_si128(buf.as_ptr().add(offset) as *const __m128i);
         let cr_mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'\r' as i8)));
-        
+
         if cr_mask != 0 {
             // Check each CR position for a following LF
             let mut bit = 1;
@@ -70,41 +74,20 @@ unsafe fn find_crlf_sse2(buf: &[u8]) -> Option<usize> {
                 bit <<= 1;
             }
         }
-        
+
         offset += 16;
     }
-    
+
     // Fall back to standard search for remaining bytes
     find_crlf_fallback(&buf[offset..]).map(|pos| offset + pos)
 }
 
-/// ARM NEON implementation
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-#[inline(always)]
-unsafe fn find_crlf_neon(buf: &[u8]) -> Option<usize> {
-    use std::arch::aarch64::{uint8x16_t, vld1q_u8, vcreq_u8, vmovq_n_u8, vgetq_lane_u8};
-    
-    let mut offset = 0;
-    let len = buf.len();
-    
-    while offset <= len - 17 {
-        let chunk = vld1q_u8(buf.as_ptr().add(offset));
-        let cr_mask = vcreq_u8(chunk, vmovq_n_u8(b'\r'));
-        
-        // Process each byte to check for CR followed by LF
-        for i in 0..16 {
-            if vgetq_lane_u8(cr_mask, i) != 0 && offset + i + 1 < len && buf[offset + i + 1] == b'\n' {
-                return Some(offset + i);
-            }
-        }
-        
-        offset += 16;
-    }
-    
-    // Fall back to standard search for remaining bytes
-    find_crlf_fallback(&buf[offset..]).map(|pos| offset + pos)
-}
+// NOTE: A hand-written NEON path previously lived here but used a non-existent
+// intrinsic (`vcreq_u8`) and a runtime lane index with `vgetq_lane_u8` (which
+// requires a const lane), so it never compiled on aarch64 and was never
+// dispatched to from `find_crlf`. It has been removed. On non-x86_64 targets
+// `find_crlf` uses `find_crlf_fallback`, whose `memchr` backend is itself
+// NEON-accelerated on aarch64, so no real throughput is lost.
 
 /// Standard fallback implementation for CRLF search
 #[inline(always)]

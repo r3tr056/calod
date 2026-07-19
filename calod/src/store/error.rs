@@ -1,6 +1,5 @@
 use std::io;
 use thiserror::Error;
-use tracing::error;
 
 /// Cache errors that can occur during operations
 #[derive(Debug, Error, Clone)]
@@ -40,26 +39,25 @@ pub enum CacheError {
 
     #[error("Transaction failed: {0}")]
     TransactionFailed(String),
-    
+
     #[error("Operation would exceed memory limit")]
     MemoryLimitExceeded,
-    
+
     #[error("Write operation failed due to read-only mode")]
     ReadOnlyMode,
-    
+
     #[error("Authentication failed")]
     AuthenticationFailed,
-    
+
     #[error("Permission denied")]
     PermissionDenied,
-    
+
     #[error("Replication error: {0}")]
     ReplicationError(String),
-    
+
     #[error("Cluster error: {0}")]
     ClusterError(String),
-    
-    
+
     #[error("Configuration error: {0}")]
     ConfigurationError(String),
 }

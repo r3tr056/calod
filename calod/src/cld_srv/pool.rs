@@ -1,24 +1,29 @@
-use std::{sync::Arc, time::Duration};
-use std::io::Error;
 use ahash::RandomState;
 use bb8::{ManageConnection, Pool as Bb8Pool, RunError};
 use dashmap::DashMap;
+use std::io::Error;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::{Mutex, Semaphore};
 use uuid::Uuid;
 
-use super::{auth::AuthManager, connection::{Connection, ConnectionConfig}, metrics::MetricsAggregator, served_store::ServedCalodStore};
+use super::{
+    auth::AuthManager,
+    connection::{Connection, ConnectionConfig},
+    metrics::MetricsAggregator,
+    served_store::ServedCalodStore,
+};
 
 #[derive(thiserror::Error, Debug)]
 pub enum CalodError {
     #[error("I/O error: {0}")]
     IoError(#[from] Error),
-    
+
     #[error("Connection pool error: {0}")]
     PoolError(String),
 
     #[error("Connection limit reached")]
     ConnectionLimitReached,
-    
+
     #[error("Operation timed out: {0}")]
     Timeout(String),
 }
@@ -42,14 +47,14 @@ pub struct PoolConfig {
 
 impl Default for PoolConfig {
     fn default() -> Self {
-        let num_cpus = num_cpus::get();
+        let max_connections = 100_000;
         Self {
             min_idle: 10,
-            max_size: (num_cpus * 4) as u32,  // 4x CPU count for optimal parallelism
-            max_lifetime_secs: 3600,          // 1 hour max connection lifetime
-            idle_timeout_secs: 300,           // 5 minutes idle timeout 
-            connection_timeout_ms: 5000,      // 5 seconds connection timeout
-            max_connections: 100_000,         // Support up to 100K connections (Redis scale)
+            max_size: max_connections as u32,
+            max_lifetime_secs: 3600,     // 1 hour max connection lifetime
+            idle_timeout_secs: 300,      // 5 minutes idle timeout
+            connection_timeout_ms: 5000, // 5 seconds connection timeout
+            max_connections,             // Support up to 100K connections (Redis scale)
         }
     }
 }
@@ -62,12 +67,17 @@ pub struct CalodConnectionManager {
 }
 
 impl CalodConnectionManager {
-    pub fn new(store: Arc<ServedCalodStore>, config: ConnectionConfig, metrics: Arc<MetricsAggregator>, auth_manager: Arc<AuthManager>) -> Self {
+    pub fn new(
+        store: Arc<ServedCalodStore>,
+        config: ConnectionConfig,
+        metrics: Arc<MetricsAggregator>,
+        auth_manager: Arc<AuthManager>,
+    ) -> Self {
         Self {
             store,
             config,
             metrics,
-            auth_manager
+            auth_manager,
         }
     }
 }
@@ -89,7 +99,10 @@ impl ManageConnection for CalodConnectionManager {
     async fn is_valid(&self, conn: &mut Self::Connection) -> Result<(), Self::Error> {
         let connection = conn.lock().await;
         if connection.get_uptime() > Duration::from_secs(3600) {
-            return Err(Error::new(std::io::ErrorKind::TimedOut, "Connection too old"));
+            return Err(Error::new(
+                std::io::ErrorKind::TimedOut,
+                "Connection too old",
+            ));
         }
 
         Ok(())
@@ -105,7 +118,6 @@ pub struct Pool {
     inner: Arc<Bb8Pool<CalodConnectionManager>>,
     conn_semaphore: Arc<Semaphore>, // For global connection limiting
     active_connections: Arc<DashMap<Uuid, Arc<Mutex<Connection>>, RandomState>>,
-    config: PoolConfig,
     metrics: Arc<MetricsAggregator>,
 }
 
@@ -116,15 +128,17 @@ impl Pool {
         auth_manager: Arc<AuthManager>,
         metrics: Arc<MetricsAggregator>,
     ) -> Result<Self, CalodError> {
-        let store = Arc::new(ServedCalodStore::new());
-        let manager = CalodConnectionManager::new(store, connection_config, metrics.clone(), auth_manager);
+        let store = Arc::new(ServedCalodStore::new_with_metrics(metrics.clone()).await);
+        let manager =
+            CalodConnectionManager::new(store, connection_config, metrics.clone(), auth_manager);
 
         // Setup connection semaphore to limit total connections
         let conn_semaphore = Arc::new(Semaphore::new(pool_config.max_connections));
-        
-        // Setup connection tracking with optimized DashMap
-        let active_connections: Arc<DashMap<Uuid, Arc<Mutex<Connection>>, RandomState>>= Arc::new(DashMap::with_capacity_and_hasher(1024, ahash::RandomState::new()));
 
+        // Setup connection tracking with optimized DashMap
+        let active_connections: Arc<DashMap<Uuid, Arc<Mutex<Connection>>, RandomState>> = Arc::new(
+            DashMap::with_capacity_and_hasher(1024, ahash::RandomState::new()),
+        );
 
         let pool = Bb8Pool::builder()
             .max_size(pool_config.max_size)
@@ -134,19 +148,20 @@ impl Pool {
             .connection_timeout(Duration::from_millis(pool_config.connection_timeout_ms))
             .build(manager)
             .await?;
-            
+
         Ok(Self {
             inner: Arc::new(pool),
             conn_semaphore,
             active_connections,
-            config: pool_config,
             metrics,
         })
     }
 
     /// Acquire a connection with timeout
     #[inline]
-    pub async fn get(&self) -> Result<bb8::PooledConnection<'_, CalodConnectionManager>, CalodError> {
+    pub async fn get(
+        &self,
+    ) -> Result<bb8::PooledConnection<'_, CalodConnectionManager>, CalodError> {
         if let Ok(permit) = self.conn_semaphore.acquire().await {
             permit.forget();
 
@@ -196,7 +211,13 @@ pub async fn create_connection_pool() -> Result<Pool, CalodError> {
     let auth_manager = Arc::new(AuthManager::new(false));
     let metrics = Arc::new(MetricsAggregator::new());
 
-    Pool::new(PoolConfig::default(), ConnectionConfig::default(), auth_manager, metrics).await
+    Pool::new(
+        PoolConfig::default(),
+        ConnectionConfig::default(),
+        auth_manager,
+        metrics,
+    )
+    .await
 }
 
 /// Create secure connection pool with authentication
@@ -207,13 +228,29 @@ pub async fn create_secure_connection_pool(password: Option<&str>) -> Result<Poo
     if let Some(pass) = password {
         auth_manager.add_password(pass);
     }
-    
+
     let metrics = Arc::new(MetricsAggregator::new());
-    
+
     Pool::new(
         PoolConfig::default(),
         ConnectionConfig::default(),
         auth_manager,
-        metrics
-    ).await
+        metrics,
+    )
+    .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PoolConfig;
+
+    #[test]
+    fn default_pool_size_does_not_cap_advertised_connection_limit() {
+        let config = PoolConfig::default();
+
+        assert!(
+            config.max_size as usize >= config.max_connections,
+            "bb8 pool max_size must not reject clients before max_connections is reached"
+        );
+    }
 }

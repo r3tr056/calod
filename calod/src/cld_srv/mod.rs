@@ -1,6 +1,10 @@
+pub mod auth;
 pub mod command;
-pub mod pool;
-pub mod served_store;
 pub mod connection;
 pub mod metrics;
-pub mod auth;
+pub mod pool;
+pub mod protocol;
+pub mod pubsub;
+pub mod reply;
+pub mod scripting;
+pub mod served_store;
