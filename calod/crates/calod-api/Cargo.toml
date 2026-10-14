@@ -1,0 +1,18 @@
+[package]
+name = "calod-api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = "0.8"
+calod-core = { path = "../calod-core" }
+calod-ledger = { path = "../calod-ledger" }
+calod-storage = { path = "../calod-storage" }
+chrono = { version = "0.4", default-features = false, features = ["std", "alloc"] }
+serde = { version = "1.0.215", features = ["derive"] }
+serde_json = "1.0.132"
+serde_urlencoded = "0.7"
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+tracing = "0.1.41"
+uuid = { version = "1.13.1", features = ["v4", "v7", "serde"] }

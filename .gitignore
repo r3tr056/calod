@@ -31,3 +31,12 @@ redis-rs/
 # Benchmark + tcl-suite run artifacts
 calod/benchmark-results/
 calod/tcl-results/
+
+# Python SDK local environments and build artifacts
+**/.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Local Claude Code settings (machine-specific)
+.claude/settings.local.json

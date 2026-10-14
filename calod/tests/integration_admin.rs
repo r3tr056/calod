@@ -15,7 +15,12 @@ async fn debug_and_memory_introspection() {
         .await
         .expect("connect");
 
-    let _: () = redis::cmd("SET").arg("k").arg("v").query_async(&mut conn).await.unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("k")
+        .arg("v")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
 
     // DEBUG OBJECT returns an encoding description for an existing key.
     let obj: String = redis::cmd("DEBUG")
@@ -35,7 +40,11 @@ async fn debug_and_memory_introspection() {
     assert!(missing.is_err());
 
     // DEBUG JMAP / SET-ACTIVE-EXPIRE are accepted no-ops.
-    let jmap: String = redis::cmd("DEBUG").arg("JMAP").query_async(&mut conn).await.unwrap();
+    let jmap: String = redis::cmd("DEBUG")
+        .arg("JMAP")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
     assert_eq!(jmap, "OK");
     let sae: String = redis::cmd("DEBUG")
         .arg("SET-ACTIVE-EXPIRE")
@@ -61,7 +70,11 @@ async fn debug_and_memory_introspection() {
         .unwrap();
     assert_eq!(usage_missing, None);
 
-    let doctor: String = redis::cmd("MEMORY").arg("DOCTOR").query_async(&mut conn).await.unwrap();
+    let doctor: String = redis::cmd("MEMORY")
+        .arg("DOCTOR")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
     assert!(!doctor.is_empty());
 
     server.shutdown().await;
@@ -76,14 +89,30 @@ async fn slowlog_latency_lolwut() {
         .await
         .expect("connect");
 
-    let len: i64 = redis::cmd("SLOWLOG").arg("LEN").query_async(&mut conn).await.unwrap();
+    let len: i64 = redis::cmd("SLOWLOG")
+        .arg("LEN")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
     assert_eq!(len, 0);
-    let entries: Vec<Value> = redis::cmd("SLOWLOG").arg("GET").query_async(&mut conn).await.unwrap();
+    let entries: Vec<Value> = redis::cmd("SLOWLOG")
+        .arg("GET")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
     assert!(entries.is_empty());
-    let reset: String = redis::cmd("SLOWLOG").arg("RESET").query_async(&mut conn).await.unwrap();
+    let reset: String = redis::cmd("SLOWLOG")
+        .arg("RESET")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
     assert_eq!(reset, "OK");
 
-    let lat_reset: i64 = redis::cmd("LATENCY").arg("RESET").query_async(&mut conn).await.unwrap();
+    let lat_reset: i64 = redis::cmd("LATENCY")
+        .arg("RESET")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
     assert_eq!(lat_reset, 0);
     let lat_hist: Vec<Value> = redis::cmd("LATENCY")
         .arg("HISTORY")
@@ -108,14 +137,30 @@ async fn acl_function_and_client_subcommands() {
         .await
         .expect("connect");
 
-    let whoami: String = redis::cmd("ACL").arg("WHOAMI").query_async(&mut conn).await.unwrap();
+    let whoami: String = redis::cmd("ACL")
+        .arg("WHOAMI")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
     assert_eq!(whoami, "default");
-    let cats: Vec<String> = redis::cmd("ACL").arg("CAT").query_async(&mut conn).await.unwrap();
+    let cats: Vec<String> = redis::cmd("ACL")
+        .arg("CAT")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
     assert!(cats.iter().any(|c| c == "read"));
-    let list: Vec<String> = redis::cmd("ACL").arg("LIST").query_async(&mut conn).await.unwrap();
+    let list: Vec<String> = redis::cmd("ACL")
+        .arg("LIST")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
     assert!(list[0].contains("default"));
 
-    let flist: Vec<Value> = redis::cmd("FUNCTION").arg("LIST").query_async(&mut conn).await.unwrap();
+    let flist: Vec<Value> = redis::cmd("FUNCTION")
+        .arg("LIST")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
     assert!(flist.is_empty());
 
     // CLIENT SETINFO / NO-EVICT / NO-TOUCH are accepted (clients send these).
@@ -158,14 +203,27 @@ async fn reset_restores_default_state() {
         .expect("connect");
 
     // Switch DB, then RESET should bring us back to DB 0.
-    let _: String = redis::cmd("SELECT").arg(3).query_async(&mut conn).await.unwrap();
-    let _: () = redis::cmd("SET").arg("rk").arg("rv").query_async(&mut conn).await.unwrap();
+    let _: String = redis::cmd("SELECT")
+        .arg(3)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("rk")
+        .arg("rv")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
 
     let reset: String = redis::cmd("RESET").query_async(&mut conn).await.unwrap();
     assert_eq!(reset, "RESET");
 
     // After RESET we are on DB 0, where "rk" (written in DB 3) does not exist.
-    let got: Option<String> = redis::cmd("GET").arg("rk").query_async(&mut conn).await.unwrap();
+    let got: Option<String> = redis::cmd("GET")
+        .arg("rk")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
     assert_eq!(got, None);
 
     server.shutdown().await;

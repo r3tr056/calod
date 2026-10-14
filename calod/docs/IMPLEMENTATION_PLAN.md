@@ -1,5 +1,12 @@
 # Calod v1.0 Implementation Plan
 
+> **ARCHIVED — 2026-07-23.** This document planned Calod as "a faster Redis."
+> That positioning is rejected. The current product direction is in
+> `PRODUCT_STRATEGY_V2_REFINED.md` (durable action ledger for AI agents).
+> This file is kept only as a technical reference: its hygiene, durability,
+> security, and observability engineering work remains useful and is being
+> reused. Do not plan against this document.
+
 Status: finalized after codebase audit + requirements interview + technical research (2026-07-19).
 
 ## 1. North Star

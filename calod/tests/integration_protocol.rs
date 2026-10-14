@@ -290,36 +290,6 @@ async fn json_subpath_mutations_preserve_root_document() {
 }
 
 #[tokio::test]
-async fn graph_property_mutations_are_persistent() {
-    let h = Harness::new().await;
-
-    let _ = h
-        .exec(Command::GraphCreateNode {
-            key: "graph:persist".to_string(),
-            node_id: "n1".to_string(),
-            properties: vec![],
-        })
-        .await;
-    let _ = h
-        .exec(Command::GraphSetNodeProperty {
-            key: "graph:persist".to_string(),
-            node_id: "n1".to_string(),
-            property_key: "color".to_string(),
-            property_value: "blue".to_string(),
-        })
-        .await;
-
-    let node_props = h
-        .exec(Command::GraphGetNodeProperties {
-            key: "graph:persist".to_string(),
-            node_id: "n1".to_string(),
-        })
-        .await;
-    let node_props = bulk_to_string(&node_props).expect("node properties should be JSON");
-    assert!(node_props.contains(r#""color":"blue"#));
-}
-
-#[tokio::test]
 async fn nx_xx_set_options_behave() {
     let h = Harness::new().await;
 

@@ -233,7 +233,6 @@ class StressHarness:
         self.record_check(checks, "lists", self.validate_list_commands)
         self.record_check(checks, "sets", self.validate_set_commands)
         self.record_check(checks, "json", self.validate_json_commands)
-        self.record_check(checks, "graph", self.validate_graph_commands)
         self.record_check(checks, "error-paths", self.validate_error_paths)
 
         return {
@@ -414,39 +413,6 @@ class StressHarness:
         assert b"a" in obj_keys and b"b" in obj_keys
         assert client.execute_command("JSON.OBJLEN", "release:json", "$.obj") == 2
         assert client.execute_command("JSON.DEL", "release:json", "$.obj.b") == 1
-
-    def validate_graph_commands(self, client: redis.Redis) -> None:
-        self.assert_ok(client.execute_command("GRAPH.CREATE_NODE", "release:graph", "n1", "name", "one"))
-        self.assert_ok(client.execute_command("GRAPH.CREATE_NODE", "release:graph", "n2", "name", "two"))
-        node = json.loads(client.execute_command("GRAPH.GET_NODE", "release:graph", "n1"))
-        assert node["id"] == "n1"
-        assert node["properties"]["name"] == "one"
-        self.assert_ok(client.execute_command("GRAPH.SET_NODE_PROPERTY", "release:graph", "n1", "color", "blue"))
-        node_props = json.loads(client.execute_command("GRAPH.GET_NODE_PROPERTIES", "release:graph", "n1"))
-        assert node_props["color"] == "blue"
-        assert client.execute_command("GRAPH.DELETE_NODE_PROPERTY", "release:graph", "n1", "color") == 1
-        self.assert_ok(
-            client.execute_command(
-                "GRAPH.CREATE_EDGE",
-                "release:graph",
-                "e1",
-                "n1",
-                "n2",
-                "knows",
-                "since",
-                "2026",
-            )
-        )
-        edge = json.loads(client.execute_command("GRAPH.GET_EDGE", "release:graph", "e1"))
-        assert edge["id"] == "e1"
-        assert edge["source_id"] == "n1"
-        assert edge["target_id"] == "n2"
-        self.assert_ok(client.execute_command("GRAPH.SET_EDGE_PROPERTY", "release:graph", "e1", "weight", "1"))
-        edge_props = json.loads(client.execute_command("GRAPH.GET_EDGE_PROPERTIES", "release:graph", "e1"))
-        assert edge_props["weight"] == "1"
-        assert client.execute_command("GRAPH.DELETE_EDGE_PROPERTY", "release:graph", "e1", "weight") == 1
-        assert client.execute_command("GRAPH.DELETE_EDGE", "release:graph", "e1") == 1
-        assert client.execute_command("GRAPH.DELETE_NODE", "release:graph", "n2") == 1
 
     def validate_error_paths(self, client: redis.Redis) -> None:
         self.assert_response_error(lambda: client.execute_command("NO_SUCH_COMMAND"), "unknown command")

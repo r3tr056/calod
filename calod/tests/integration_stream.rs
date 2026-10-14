@@ -135,7 +135,11 @@ async fn stream_autoid_del_trim() {
         .query_async(&mut conn)
         .await
         .unwrap();
-    let len: i64 = redis::cmd("XLEN").arg("a").query_async(&mut conn).await.unwrap();
+    let len: i64 = redis::cmd("XLEN")
+        .arg("a")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
     assert_eq!(len, 3);
 
     // XDEL removes a specific entry and returns the deleted count.
@@ -146,7 +150,11 @@ async fn stream_autoid_del_trim() {
         .await
         .unwrap();
     assert_eq!(deleted, 1);
-    let len2: i64 = redis::cmd("XLEN").arg("a").query_async(&mut conn).await.unwrap();
+    let len2: i64 = redis::cmd("XLEN")
+        .arg("a")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
     assert_eq!(len2, 2);
 
     // XTRIM MAXLEN keeps only the newest entry (c).

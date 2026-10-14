@@ -1,0 +1,1573 @@
+openapi: 3.1.0
+info:
+  title: Calod Action Ledger API
+  version: 0.1.0
+  description: |
+    Public contract for Calod's durable AI-agent action/effect ledger.
+
+    The API coordinates idempotent tool execution. It does not claim exactly-once
+    delivery across arbitrary external systems. When a downstream outcome cannot
+    be proven after a failure, the effect enters `outcome_unknown` and requires
+    reconciliation rather than an automatic retry.
+  license:
+    name: MIT
+    url: https://opensource.org/license/mit
+  contact:
+    name: Calod maintainers
+    url: https://github.com/r3tr056/calod
+servers:
+  - url: https://api.calod.dev/v1
+    description: Managed production service
+  - url: http://calod:7379/v1
+    description: Docker Compose development server
+tags:
+  - name: System
+    description: Health and version endpoints.
+  - name: Runs
+    description: Agent-run lifecycle and immutable lineage.
+  - name: Events
+    description: Append-only run events.
+  - name: Checkpoints
+    description: Immutable run-state checkpoints.
+  - name: Effects
+    description: Idempotent external action coordination and receipts.
+security:
+  - ApiKeyAuth: []
+paths:
+  /health/live:
+    get:
+      tags: [System]
+      summary: Check process liveness
+      operationId: getLiveness
+      security: []
+      responses:
+        "200":
+          description: Process is alive.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+              example:
+                status: ok
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /health/ready:
+    get:
+      tags: [System]
+      summary: Check service readiness
+      operationId: getReadiness
+      security: []
+      responses:
+        "200":
+          description: Service can accept durable writes.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+  /version:
+    get:
+      tags: [System]
+      summary: Get API and server versions
+      operationId: getVersion
+      security: []
+      responses:
+        "200":
+          description: Version information.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Version"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /runs:
+    post:
+      tags: [Runs]
+      summary: Create an agent run
+      operationId: createRun
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateRunRequest"
+            example:
+              external_id: order-agent-run-8841
+              agent_name: order-refund-agent
+              metadata:
+                order_id: ord_8841
+      responses:
+        "201":
+          description: Run created.
+          headers:
+            Location:
+              description: Canonical URL of the new run.
+              schema:
+                type: string
+                format: uri-reference
+            ETag:
+              $ref: "#/components/headers/ETag"
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    get:
+      tags: [Runs]
+      summary: List agent runs
+      operationId: listRuns
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+        - name: status
+          in: query
+          description: Filter by run status.
+          schema:
+            $ref: "#/components/schemas/RunStatus"
+        - name: agent_name
+          in: query
+          description: Filter by exact agent name.
+          schema:
+            type: string
+            maxLength: 200
+        - name: created_after
+          in: query
+          description: Return runs created at or after this time.
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: Cursor-paginated runs ordered by creation time and ID descending.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RunList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+  /runs/{run_id}:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+    get:
+      tags: [Runs]
+      summary: Get an agent run
+      operationId: getRun
+      responses:
+        "200":
+          description: Run found.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [Runs]
+      summary: Transition an agent run
+      description: Uses optimistic concurrency; `If-Match` must contain the current run ETag.
+      operationId: updateRun
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateRunRequest"
+            example:
+              status: completed
+      responses:
+        "200":
+          description: Run transitioned.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+  /runs/{run_id}/forks:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+    post:
+      tags: [Runs]
+      summary: Fork a run from an event or checkpoint
+      operationId: forkRun
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ForkRunRequest"
+            example:
+              from_event_sequence: 42
+              reason: reproduce-payment-timeout
+      responses:
+        "201":
+          description: Forked run created.
+          headers:
+            Location:
+              description: Canonical URL of the forked run.
+              schema:
+                type: string
+                format: uri-reference
+            ETag:
+              $ref: "#/components/headers/ETag"
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+  /runs/{run_id}/events:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+    post:
+      tags: [Events]
+      summary: Append an immutable run event
+      operationId: appendRunEvent
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AppendEventRequest"
+            example:
+              type: model.response
+              occurred_at: "2026-07-23T10:30:00Z"
+              payload:
+                model: example-model
+                output_ref: encrypted://payload/019abc
+      responses:
+        "201":
+          description: Event appended.
+          headers:
+            Location:
+              description: Canonical URL fragment for the event.
+              schema:
+                type: string
+                format: uri-reference
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Event"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+    get:
+      tags: [Events]
+      summary: List run events
+      operationId: listRunEvents
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+        - name: type
+          in: query
+          description: Filter by exact event type.
+          schema:
+            type: string
+            maxLength: 200
+        - name: after_sequence
+          in: query
+          description: Return events with a sequence greater than this value.
+          schema:
+            type: integer
+            format: int64
+            minimum: 0
+      responses:
+        "200":
+          description: Cursor-paginated events ordered by sequence ascending.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EventList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /runs/{run_id}/checkpoints:
+    parameters:
+      - $ref: "#/components/parameters/RunId"
+    post:
+      tags: [Checkpoints]
+      summary: Create an immutable run checkpoint
+      operationId: createCheckpoint
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateCheckpointRequest"
+            example:
+              event_sequence: 42
+              state:
+                messages: 18
+                pending_approval: false
+      responses:
+        "201":
+          description: Checkpoint created.
+          headers:
+            Location:
+              description: Canonical URL fragment for the checkpoint.
+              schema:
+                type: string
+                format: uri-reference
+            ETag:
+              $ref: "#/components/headers/ETag"
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Checkpoint"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+    get:
+      tags: [Checkpoints]
+      summary: List run checkpoints
+      operationId: listCheckpoints
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Cursor-paginated checkpoints ordered by event sequence descending.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CheckpointList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /effects:
+    post:
+      tags: [Effects]
+      summary: Acquire or inspect an idempotent effect
+      description: |
+        Atomically creates, reacquires, or replays an effect identified by the
+        `Idempotency-Key` header within the supplied scope.
+
+        - `201 execute`: caller owns a new lease and may invoke the tool.
+        - `200 replay`: the committed result is returned without tool execution.
+        - `202 wait`: another valid lease owns the effect.
+        - `200 reconcile`: a previous outcome is unknown and must not be retried blindly.
+        - `409`: the same key was used with a different canonical input digest.
+      operationId: acquireEffect
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AcquireEffectRequest"
+            example:
+              run_id: 019b0000-7a40-7000-8000-000000000001
+              scope: tenant-123:order-8841
+              tool_name: stripe.charge
+              input:
+                customer_id: cus_123
+                amount_minor: 5000
+                currency: usd
+              lease_duration_seconds: 30
+      responses:
+        "200":
+          description: Existing effect is replayable or requires reconciliation.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EffectDecision"
+              examples:
+                replay:
+                  value:
+                    decision: replay
+                    effect:
+                      id: 019b0000-7a40-7000-8000-000000000002
+                      run_id: 019b0000-7a40-7000-8000-000000000001
+                      scope: tenant-123:order-8841
+                      idempotency_key: charge-order-8841
+                      tool_name: stripe.charge
+                      input_digest: sha256:43f7e2
+                      state: committed
+                      fencing_token: 1
+                      result:
+                        charge_id: ch_123
+                      created_at: "2026-07-23T10:30:00Z"
+                      updated_at: "2026-07-23T10:30:01Z"
+                    lease_token: null
+                    poll_after_ms: null
+                reconcile:
+                  value:
+                    decision: reconcile
+                    effect:
+                      id: 019b0000-7a40-7000-8000-000000000002
+                      scope: tenant-123:order-8841
+                      idempotency_key: charge-order-8841
+                      tool_name: stripe.charge
+                      input_digest: sha256:43f7e2
+                      state: outcome_unknown
+                      fencing_token: 1
+                      created_at: "2026-07-23T10:30:00Z"
+                      updated_at: "2026-07-23T10:30:30Z"
+                    lease_token: null
+                    poll_after_ms: null
+        "201":
+          description: New or safely reacquired lease; caller may execute the tool.
+          headers:
+            Location:
+              description: Canonical URL of the effect.
+              schema:
+                type: string
+                format: uri-reference
+            ETag:
+              $ref: "#/components/headers/ETag"
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EffectDecision"
+              example:
+                decision: execute
+                effect:
+                  id: 019b0000-7a40-7000-8000-000000000002
+                  run_id: 019b0000-7a40-7000-8000-000000000001
+                  scope: tenant-123:order-8841
+                  idempotency_key: charge-order-8841
+                  tool_name: stripe.charge
+                  input_digest: sha256:43f7e2
+                  state: in_progress
+                  fencing_token: 1
+                  lease:
+                    expires_at: "2026-07-23T10:30:30Z"
+                  created_at: "2026-07-23T10:30:00Z"
+                  updated_at: "2026-07-23T10:30:00Z"
+                lease_token: lease_0123456789abcdef0123456789abcdef
+                poll_after_ms: null
+        "202":
+          description: Another worker owns an unexpired lease; poll the effect after the advised delay.
+          headers:
+            Retry-After:
+              description: Whole seconds before polling again.
+              schema:
+                type: integer
+                minimum: 1
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EffectDecision"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+    get:
+      tags: [Effects]
+      summary: List effects
+      operationId: listEffects
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+        - name: run_id
+          in: query
+          description: Filter by run ID.
+          schema:
+            type: string
+            format: uuid
+        - name: state
+          in: query
+          description: Filter by effect state.
+          schema:
+            $ref: "#/components/schemas/EffectState"
+        - name: tool_name
+          in: query
+          description: Filter by exact tool name.
+          schema:
+            type: string
+            maxLength: 200
+        - name: created_after
+          in: query
+          description: Return effects created at or after this time.
+          schema:
+            type: string
+            format: date-time
+      responses:
+        "200":
+          description: Cursor-paginated effects ordered by creation time and ID descending.
+          headers:
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EffectList"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+  /effects/{effect_id}:
+    parameters:
+      - $ref: "#/components/parameters/EffectId"
+    get:
+      tags: [Effects]
+      summary: Get an effect and its current receipt
+      operationId: getEffect
+      responses:
+        "200":
+          description: Effect found.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Effect"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [Effects]
+      summary: Transition, renew, or reconcile an effect
+      description: |
+        The active lease token and fencing token are required for worker-owned
+        transitions. Manual reconciliation additionally requires the
+        `effects:reconcile` API-key scope. `If-Match` protects against concurrent
+        resource updates.
+      operationId: updateEffect
+      parameters:
+        - $ref: "#/components/parameters/IfMatch"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateEffectRequest"
+            examples:
+              commit:
+                value:
+                  transition: commit
+                  lease_token: lease_0123456789abcdef0123456789abcdef
+                  fencing_token: 1
+                  result:
+                    charge_id: ch_123
+                  external_receipt:
+                    provider: stripe
+                    id: ch_123
+              unknown:
+                value:
+                  transition: mark_outcome_unknown
+                  lease_token: lease_0123456789abcdef0123456789abcdef
+                  fencing_token: 1
+                  failure:
+                    kind: timeout_after_send
+                    message: Tool request may have reached the provider.
+              reconcile:
+                value:
+                  transition: reconcile_committed
+                  fencing_token: 1
+                  result:
+                    charge_id: ch_123
+                  external_receipt:
+                    provider: stripe
+                    id: ch_123
+      responses:
+        "200":
+          description: Effect transitioned.
+          headers:
+            ETag:
+              $ref: "#/components/headers/ETag"
+            X-Request-ID:
+              $ref: "#/components/headers/RequestId"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Effect"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "412":
+          $ref: "#/components/responses/PreconditionFailed"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "422":
+          $ref: "#/components/responses/UnprocessableEntity"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Calod-Key
+      description: Project-scoped Calod API key. Keys are displayed once and stored hashed.
+  parameters:
+    RunId:
+      name: run_id
+      in: path
+      required: true
+      description: UUIDv7 run identifier.
+      schema:
+        type: string
+        format: uuid
+    EffectId:
+      name: effect_id
+      in: path
+      required: true
+      description: UUIDv7 effect identifier.
+      schema:
+        type: string
+        format: uuid
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque cursor returned by the previous page. Cursors bind filters and sort order.
+      schema:
+        type: string
+        maxLength: 2048
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: Page size.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Stable business-operation key, unique within project and effect scope.
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 255
+        pattern: "^[A-Za-z0-9._:-]+$"
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      description: Current strong ETag for optimistic concurrency control.
+      schema:
+        type: string
+        minLength: 3
+  headers:
+    RequestId:
+      description: Stable request identifier for diagnostics.
+      schema:
+        type: string
+        example: req_019b00007a4070008000000000000003
+    ETag:
+      description: Strong resource version used with `If-Match`.
+      schema:
+        type: string
+        example: '"7"'
+    RateLimitLimit:
+      description: Request quota for the current window.
+      schema:
+        type: integer
+        minimum: 0
+    RateLimitRemaining:
+      description: Requests remaining in the current window.
+      schema:
+        type: integer
+        minimum: 0
+    RateLimitReset:
+      description: Unix timestamp when the current window resets.
+      schema:
+        type: integer
+        format: int64
+  schemas:
+    JsonValue:
+      description: Arbitrary JSON value. Managed plans enforce payload and retention limits.
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+    Version:
+      type: object
+      additionalProperties: false
+      required: [api_version, server_version, status]
+      properties:
+        api_version:
+          type: string
+          example: v1
+        server_version:
+          type: string
+          example: 0.1.0
+        status:
+          type: string
+          enum: [alpha, beta, stable, deprecated]
+    RunStatus:
+      type: string
+      enum: [running, suspended, completed, failed, cancelled]
+    Run:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - external_id
+        - agent_name
+        - status
+        - version
+        - last_event_sequence
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        external_id:
+          type: string
+          maxLength: 255
+        agent_name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        status:
+          $ref: "#/components/schemas/RunStatus"
+        version:
+          type: integer
+          format: int64
+          minimum: 1
+          readOnly: true
+        last_event_sequence:
+          type: integer
+          format: int64
+          minimum: 0
+          readOnly: true
+        parent_run_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: "null"
+          readOnly: true
+        forked_from_event_sequence:
+          oneOf:
+            - type: integer
+              format: int64
+              minimum: 0
+            - type: "null"
+          readOnly: true
+        metadata:
+          $ref: "#/components/schemas/JsonValue"
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+    CreateRunRequest:
+      type: object
+      additionalProperties: false
+      required: [external_id, agent_name]
+      properties:
+        external_id:
+          type: string
+          minLength: 1
+          maxLength: 255
+        agent_name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        metadata:
+          $ref: "#/components/schemas/JsonValue"
+    UpdateRunRequest:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          $ref: "#/components/schemas/RunStatus"
+    ForkRunRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      oneOf:
+        - required: [from_event_sequence]
+        - required: [from_checkpoint_id]
+      properties:
+        from_event_sequence:
+          type: integer
+          format: int64
+          minimum: 0
+        from_checkpoint_id:
+          type: string
+          format: uuid
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 500
+        metadata:
+          $ref: "#/components/schemas/JsonValue"
+    Event:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - run_id
+        - sequence
+        - type
+        - occurred_at
+        - recorded_at
+        - previous_hash
+        - hash
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        run_id:
+          type: string
+          format: uuid
+          readOnly: true
+        sequence:
+          type: integer
+          format: int64
+          minimum: 1
+          readOnly: true
+        type:
+          type: string
+          minLength: 1
+          maxLength: 200
+          pattern: "^[a-z0-9_.-]+$"
+        occurred_at:
+          type: string
+          format: date-time
+        recorded_at:
+          type: string
+          format: date-time
+          readOnly: true
+        payload:
+          $ref: "#/components/schemas/JsonValue"
+        previous_hash:
+          type: string
+          readOnly: true
+          pattern: "^sha256:[a-f0-9]{64}$"
+        hash:
+          type: string
+          readOnly: true
+          pattern: "^sha256:[a-f0-9]{64}$"
+    AppendEventRequest:
+      type: object
+      additionalProperties: false
+      required: [type, occurred_at, payload]
+      properties:
+        type:
+          type: string
+          minLength: 1
+          maxLength: 200
+          pattern: "^[a-z0-9_.-]+$"
+        occurred_at:
+          type: string
+          format: date-time
+        payload:
+          $ref: "#/components/schemas/JsonValue"
+    Checkpoint:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - run_id
+        - event_sequence
+        - state_digest
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        run_id:
+          type: string
+          format: uuid
+          readOnly: true
+        event_sequence:
+          type: integer
+          format: int64
+          minimum: 0
+        state:
+          $ref: "#/components/schemas/JsonValue"
+        state_ref:
+          oneOf:
+            - type: string
+              format: uri
+            - type: "null"
+          readOnly: true
+        state_digest:
+          type: string
+          readOnly: true
+          pattern: "^sha256:[a-f0-9]{64}$"
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+    CreateCheckpointRequest:
+      type: object
+      additionalProperties: false
+      required: [event_sequence, state]
+      properties:
+        event_sequence:
+          type: integer
+          format: int64
+          minimum: 0
+        state:
+          $ref: "#/components/schemas/JsonValue"
+    EffectState:
+      type: string
+      enum:
+        - in_progress
+        - committed
+        - failed_retryable
+        - failed_terminal
+        - outcome_unknown
+        - reconciled_committed
+        - reconciled_failed
+    EffectDecisionType:
+      type: string
+      enum: [execute, replay, wait, reconcile]
+    EffectLease:
+      type: object
+      additionalProperties: false
+      required: [expires_at]
+      properties:
+        expires_at:
+          type: string
+          format: date-time
+    ExternalReceipt:
+      type: object
+      additionalProperties: false
+      required: [provider, id]
+      properties:
+        provider:
+          type: string
+          minLength: 1
+          maxLength: 100
+        id:
+          type: string
+          minLength: 1
+          maxLength: 500
+        metadata:
+          $ref: "#/components/schemas/JsonValue"
+    EffectFailure:
+      type: object
+      additionalProperties: false
+      required: [kind, message]
+      properties:
+        kind:
+          type: string
+          minLength: 1
+          maxLength: 100
+        message:
+          type: string
+          minLength: 1
+          maxLength: 2000
+        retryable:
+          type: boolean
+          default: false
+    Effect:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - scope
+        - idempotency_key
+        - tool_name
+        - input_digest
+        - state
+        - fencing_token
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        run_id:
+          oneOf:
+            - type: string
+              format: uuid
+            - type: "null"
+        scope:
+          type: string
+          minLength: 1
+          maxLength: 500
+        idempotency_key:
+          type: string
+          minLength: 8
+          maxLength: 255
+        tool_name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        input_digest:
+          type: string
+          readOnly: true
+          pattern: "^sha256:[a-f0-9]{6,64}$"
+        state:
+          $ref: "#/components/schemas/EffectState"
+        fencing_token:
+          type: integer
+          format: int64
+          minimum: 1
+          readOnly: true
+        lease:
+          oneOf:
+            - $ref: "#/components/schemas/EffectLease"
+            - type: "null"
+        result:
+          $ref: "#/components/schemas/JsonValue"
+        external_receipt:
+          oneOf:
+            - $ref: "#/components/schemas/ExternalReceipt"
+            - type: "null"
+        failure:
+          oneOf:
+            - $ref: "#/components/schemas/EffectFailure"
+            - type: "null"
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+    AcquireEffectRequest:
+      type: object
+      additionalProperties: false
+      required: [scope, tool_name, input]
+      properties:
+        run_id:
+          type: string
+          format: uuid
+        scope:
+          type: string
+          minLength: 1
+          maxLength: 500
+        tool_name:
+          type: string
+          minLength: 1
+          maxLength: 200
+        input:
+          $ref: "#/components/schemas/JsonValue"
+        lease_duration_seconds:
+          type: integer
+          minimum: 5
+          maximum: 3600
+          default: 30
+        downstream_idempotency_supported:
+          type: boolean
+          default: false
+    EffectDecision:
+      type: object
+      additionalProperties: false
+      required: [decision, effect, lease_token, poll_after_ms]
+      properties:
+        decision:
+          $ref: "#/components/schemas/EffectDecisionType"
+        effect:
+          $ref: "#/components/schemas/Effect"
+        lease_token:
+          description: Secret bearer capability returned only for an `execute` decision.
+          oneOf:
+            - type: string
+              minLength: 32
+            - type: "null"
+        poll_after_ms:
+          oneOf:
+            - type: integer
+              minimum: 1
+            - type: "null"
+    EffectTransition:
+      type: string
+      enum:
+        - start
+        - renew
+        - commit
+        - fail_retryable
+        - fail_terminal
+        - mark_outcome_unknown
+        - reconcile_committed
+        - reconcile_failed
+    UpdateEffectRequest:
+      type: object
+      additionalProperties: false
+      required: [transition, fencing_token]
+      properties:
+        transition:
+          $ref: "#/components/schemas/EffectTransition"
+        lease_token:
+          type: string
+          minLength: 32
+          writeOnly: true
+        fencing_token:
+          type: integer
+          format: int64
+          minimum: 1
+        lease_duration_seconds:
+          type: integer
+          minimum: 5
+          maximum: 3600
+        result:
+          $ref: "#/components/schemas/JsonValue"
+        external_receipt:
+          $ref: "#/components/schemas/ExternalReceipt"
+        failure:
+          $ref: "#/components/schemas/EffectFailure"
+    CursorPage:
+      type: object
+      additionalProperties: false
+      required: [next_cursor, has_more, limit]
+      properties:
+        next_cursor:
+          oneOf:
+            - type: string
+            - type: "null"
+        has_more:
+          type: boolean
+        limit:
+          type: integer
+          minimum: 1
+          maximum: 100
+    RunList:
+      type: object
+      additionalProperties: false
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Run"
+        pagination:
+          $ref: "#/components/schemas/CursorPage"
+    EventList:
+      type: object
+      additionalProperties: false
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Event"
+        pagination:
+          $ref: "#/components/schemas/CursorPage"
+    CheckpointList:
+      type: object
+      additionalProperties: false
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Checkpoint"
+        pagination:
+          $ref: "#/components/schemas/CursorPage"
+    EffectList:
+      type: object
+      additionalProperties: false
+      required: [data, pagination]
+      properties:
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/Effect"
+        pagination:
+          $ref: "#/components/schemas/CursorPage"
+    ProblemField:
+      type: object
+      additionalProperties: false
+      required: [message]
+      properties:
+        field:
+          type: string
+        code:
+          type: string
+        message:
+          type: string
+    RetryAdvice:
+      type: object
+      additionalProperties: false
+      required: [retryable]
+      properties:
+        retryable:
+          type: boolean
+        retry_after_seconds:
+          type: integer
+          minimum: 0
+    Problem:
+      type: object
+      additionalProperties: false
+      required: [type, title, status, detail, instance, code, request_id]
+      properties:
+        type:
+          type: string
+          format: uri
+          example: https://calod.dev/problems/idempotency-conflict
+        title:
+          type: string
+          example: Idempotency key conflict
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+          example: 409
+        detail:
+          type: string
+          example: The idempotency key is already bound to a different input digest.
+        instance:
+          type: string
+          format: uri-reference
+          example: /v1/effects
+        code:
+          type: string
+          example: IDEMPOTENCY_CONFLICT
+        request_id:
+          type: string
+          example: req_019b00007a4070008000000000000003
+        errors:
+          type: array
+          items:
+            $ref: "#/components/schemas/ProblemField"
+        retry:
+          $ref: "#/components/schemas/RetryAdvice"
+  responses:
+    BadRequest:
+      description: Invalid syntax, cursor, header, or request field.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+          example:
+            type: https://calod.dev/problems/validation-error
+            title: Validation error
+            status: 400
+            detail: The request contains invalid fields.
+            instance: /v1/effects
+            code: VALIDATION_ERROR
+            request_id: req_019b00007a4070008000000000000003
+            errors:
+              - field: lease_duration_seconds
+                code: OUT_OF_RANGE
+                message: Must be between 5 and 3600.
+    Unauthorized:
+      description: Missing, invalid, expired, or revoked API key.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+          example:
+            type: https://calod.dev/problems/invalid-api-key
+            title: Authentication failed
+            status: 401
+            detail: Supply a valid project key in X-Calod-Key.
+            instance: /v1/effects
+            code: INVALID_API_KEY
+            request_id: req_019b00007a4070008000000000000003
+    Forbidden:
+      description: API key lacks the required project scope.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+          example:
+            type: https://calod.dev/problems/insufficient-scope
+            title: Insufficient scope
+            status: 403
+            detail: This transition requires effects:reconcile.
+            instance: /v1/effects/019b0000-7a40-7000-8000-000000000002
+            code: INSUFFICIENT_SCOPE
+            request_id: req_019b00007a4070008000000000000003
+    NotFound:
+      description: Resource was not found in the authenticated project.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+          example:
+            type: https://calod.dev/problems/resource-not-found
+            title: Resource not found
+            status: 404
+            detail: The requested resource does not exist.
+            instance: /v1/runs/019b0000-7a40-7000-8000-000000000001
+            code: RESOURCE_NOT_FOUND
+            request_id: req_019b00007a4070008000000000000003
+    Conflict:
+      description: Idempotency conflict, stale lease, or invalid state transition.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+          examples:
+            idempotency_conflict:
+              value:
+                type: https://calod.dev/problems/idempotency-conflict
+                title: Idempotency key conflict
+                status: 409
+                detail: The key is bound to a different canonical input digest.
+                instance: /v1/effects
+                code: IDEMPOTENCY_CONFLICT
+                request_id: req_019b00007a4070008000000000000003
+            lease_lost:
+              value:
+                type: https://calod.dev/problems/lease-lost
+                title: Lease lost
+                status: 409
+                detail: A newer fencing token owns this effect.
+                instance: /v1/effects/019b0000-7a40-7000-8000-000000000002
+                code: LEASE_LOST
+                request_id: req_019b00007a4070008000000000000003
+    PreconditionFailed:
+      description: The `If-Match` ETag does not match the current resource version.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+          example:
+            type: https://calod.dev/problems/precondition-failed
+            title: Precondition failed
+            status: 412
+            detail: Fetch the current resource and retry with its ETag.
+            instance: /v1/effects/019b0000-7a40-7000-8000-000000000002
+            code: PRECONDITION_FAILED
+            request_id: req_019b00007a4070008000000000000003
+    PayloadTooLarge:
+      description: Inline payload exceeds the configured limit; use an object reference.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+          example:
+            type: https://calod.dev/problems/payload-too-large
+            title: Payload too large
+            status: 413
+            detail: Inline payloads are limited to 1 MiB.
+            instance: /v1/runs/019b0000-7a40-7000-8000-000000000001/checkpoints
+            code: PAYLOAD_TOO_LARGE
+            request_id: req_019b00007a4070008000000000000003
+    UnprocessableEntity:
+      description: Request is syntactically valid but violates effect transition semantics.
+      headers:
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+          example:
+            type: https://calod.dev/problems/invalid-transition
+            title: Invalid effect transition
+            status: 422
+            detail: A committed effect cannot transition to failed_retryable.
+            instance: /v1/effects/019b0000-7a40-7000-8000-000000000002
+            code: INVALID_TRANSITION
+            request_id: req_019b00007a4070008000000000000003
+    TooManyRequests:
+      description: Project request or storage quota exceeded.
+      headers:
+        Retry-After:
+          description: Seconds before retrying.
+          schema:
+            type: integer
+            minimum: 1
+        X-RateLimit-Limit:
+          $ref: "#/components/headers/RateLimitLimit"
+        X-RateLimit-Remaining:
+          $ref: "#/components/headers/RateLimitRemaining"
+        X-RateLimit-Reset:
+          $ref: "#/components/headers/RateLimitReset"
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+          example:
+            type: https://calod.dev/problems/rate-limit-exceeded
+            title: Rate limit exceeded
+            status: 429
+            detail: Retry after the current quota window resets.
+            instance: /v1/effects
+            code: RATE_LIMIT_EXCEEDED
+            request_id: req_019b00007a4070008000000000000003
+            retry:
+              retryable: true
+              retry_after_seconds: 10
+    ServiceUnavailable:
+      description: Durable writes are temporarily unavailable and no state was accepted.
+      headers:
+        Retry-After:
+          description: Seconds before retrying.
+          schema:
+            type: integer
+            minimum: 1
+        X-Request-ID:
+          $ref: "#/components/headers/RequestId"
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/Problem"
+          example:
+            type: https://calod.dev/problems/service-unavailable
+            title: Service unavailable
+            status: 503
+            detail: Durable storage is not ready; retry with backoff.
+            instance: /v1/effects
+            code: SERVICE_UNAVAILABLE
+            request_id: req_019b00007a4070008000000000000003
+            retry:
+              retryable: true
+              retry_after_seconds: 5

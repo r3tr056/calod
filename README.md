@@ -1,37 +1,37 @@
 
-# Calod: Superfast, AI-Ready Data Store 🚀
+# Calod: Durable Action Ledger for AI Agents (core: a Rust data store)
 
 [![Project Status](https://img.shields.io/badge/status-beta-yellow)](https://github.com/r3tr056/calod) [![License](https://img.shields.io/badge/License-MIT-blue)](LICENSE) [![Benchmarks](https://img.shields.io/badge/Benchmarks-harness%20ready-orange)](calod/scripts/benchmark/README.md)
 
 ![Calod Logo Placeholder](https://github.com/r3tr056/calod/blob/dev/.github/images/logo.jpeg?raw=true) <!-- Replace with your actual logo image -->
 
-**A blazing-fast, sharded, and extensible data store optimized for AI applications. Built for speed, reliability, and modern workloads.**
+**Calod is becoming the durable action ledger for AI agents: when an agent retries a tool call, Calod prevents the retry from repeating a real-world side effect, records a tamper-evident receipt, and makes uncertain outcomes recoverable. The storage core is a sharded Rust data store that speaks the Redis protocol (RESP).**
+
+> Status: pre-release. The effect-ledger API is under active development (see `calod/docs/PRODUCT_STRATEGY_V2_REFINED.md`). The RESP data-store endpoint described below works today and is retained as a compatibility/inspection interface; it is not the primary product API.
 
 ## ✨ Introduction
 
-Calod is a next-generation data store engineered for extreme performance and the demands of modern AI and real-time applications.  Inspired by the speed and simplicity of Redis but built from the ground up in Rust, Calod delivers unparalleled speed, robust sharding for scalability, and advanced features tailored for AI workloads.
+Calod's core is a data store written in Rust, inspired by the Redis protocol and data model. On top of that core we are building the effect ledger: idempotent tool-execution coordination with durable receipts for AI agents that call payment, email, ticketing, CRM, and other mutation tools.
 
-**Why Calod?**
+**What Calod is honest about today:**
 
-*   **Unmatched Speed:**  Leveraging Rust's performance and low-level optimizations, Calod aims to be significantly faster than traditional key-value stores like Redis, especially in demanding scenarios.
-*   **AI-First Design:**  Calod is not just fast; it's smart. We are actively building in features crucial for AI applications, including:
-    *   **Document Data Support (JSON):** Store and query JSON documents natively with efficient path-based access.
-    *   **Vector Search (Roadmap):**  Future support for high-dimensional vector embeddings and similarity search for AI similarity tasks.
-    *   **Feature Store Capabilities:**  Designed for low-latency feature serving, essential for online machine learning inference.
-*   **Scalable and Reliable:** Sharded architecture ensures horizontal scalability to handle massive datasets and high throughput. Persistence options and high-availability features are being developed for production stability.
-*   **Extensible and Modern:** Built in Rust, Calod is designed for extensibility and integrates seamlessly with modern cloud-native environments.
+*   **Performance:** engineered for low latency, but no reproducible benchmark numbers are published yet (see the Benchmarks section).
+*   **Scalability:** sharding is in-process only. There is no clustering, replication, or failover — a single node is a single point of failure.
+*   **Durability:** snapshot + checksummed, crash-safe WAL persistence with verified restore. Do not rely on it as your only copy of data yet.
+*   **Redis compatibility:** Calod speaks RESP2/RESP3 and implements a large subset of Redis commands, but it is not a verified drop-in replacement. A compatibility matrix and the list of unsupported commands will be published with the first release.
 
 ## ⚡ Key Features
 
-*   **Blazing Fast Performance:** Optimized for low latency and high throughput using Rust and advanced data structures.
-*   **Sharded Architecture:** Horizontally scalable across multiple shards for increased capacity and concurrency.
-*   **Redis-Compatible Protocol:** Speaks the RESP protocol, allowing seamless integration with existing Redis clients (Python, Go, Node.js, etc.).
+*   **Effect ledger (in development):** idempotency-keyed tool execution with leases, fencing tokens, and an explicit `outcome_unknown` state for crash recovery.
+*   **Durable receipts:** append-only, hash-chained run timelines recording inputs, attempts, and outcomes of every protected action.
+*   **Sharded Architecture:** in-process sharding for increased capacity and concurrency on a single node.
+*   **RESP Protocol:** speaks the Redis protocol, so many existing Redis clients (Python, Go, Node.js, etc.) can connect for the compatibility endpoint.
 *   **JSON Document Support:** Native support for storing and querying JSON documents with efficient path-based operations (JSON.SET, JSON.GET, JSON.DEL, etc.).
 *   **String, Hash, List, Set Data Types:** Supports core Redis data types for versatile data storage.
-*   **Pub/Sub (Roadmap):**  Future support for Redis-style Publish/Subscribe messaging patterns.
-*   **Persistence Options:**  RDB and AOF persistence for data durability.
+*   **Pub/Sub:** Redis-style Publish/Subscribe messaging.
+*   **Persistence Options:**  Snapshot and checksummed WAL persistence with verified restore.
 *   **LRU Eviction Policy:** Efficient memory management with Least Recently Used eviction.
-*   **Comprehensive Command Set:** Implements a growing subset of Redis commands, with a focus on essential and AI-relevant operations.
+*   **Command Set:** Implements a large subset of Redis commands; a compatibility matrix will be published with the first release.
 *   **Metrics and Monitoring:**  Exposes detailed metrics for performance monitoring and observability.
 *   **Client Connection Management:** Robust handling of client connections with features like `CLIENT LIST`, `CLIENT KILL`, `CLIENT GETNAME`, `CLIENT SETNAME`.
 
@@ -149,12 +149,14 @@ No benchmark numbers are published yet — the measurement harness is built in m
 
 ## 🗺️ Roadmap
 
-*   **Vector Search and Embeddings:** Implement native vector data type and ANN indexing for similarity search.
-*   **Pub/Sub Functionality:**  Add Redis-compatible Publish/Subscribe features.
-*   **Clustering and High Availability:** Implement clustering and replication for production deployments.
-*   **Enhanced Persistence Options:** Explore more advanced persistence and backup/restore mechanisms.
-*   **More Redis Command Coverage:**  Continue to expand the set of Redis-compatible commands.
-*   **Client Libraries:** Develop and enhance client libraries for popular languages.
+*   **Effect ledger MVP:** idempotent tool execution, leases and fencing, `outcome_unknown` reconciliation, hash-chained run timelines.
+*   **Python and TypeScript SDKs:** one decorator/middleware call to protect a tool function.
+*   **Framework integrations:** LangGraph, CrewAI, OpenAI Agents SDK, generic MCP tool middleware.
+*   **Evidence export:** retention policies plus auditor-friendly export of action receipts.
+*   **Hardened durability:** binary-safe WAL, fail-closed crash recovery, automated backup-restore verification.
+*   **Clustering and High Availability:** replication and failover, only after the single-node foundation is proven.
+
+Not on the roadmap: vector search, semantic memory, a general agent framework, full workflow orchestration.
 
 ## 🤝 Contributing
 

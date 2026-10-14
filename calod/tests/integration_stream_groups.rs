@@ -10,7 +10,12 @@ use redis::streams::{StreamClaimReply, StreamReadReply};
 use redis::{FromRedisValue, Value};
 
 /// `XPENDING key group` summary reply: `[count, min-id, max-id, [[consumer, count], ...]]`.
-type PendingSummary = (i64, Option<String>, Option<String>, Option<Vec<(String, String)>>);
+type PendingSummary = (
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<Vec<(String, String)>>,
+);
 
 async fn seed(conn: &mut redis::aio::MultiplexedConnection, key: &str) {
     for (id, v) in [("1-1", "a"), ("2-1", "b"), ("3-1", "c")] {
@@ -105,7 +110,10 @@ async fn group_create_read_ack_pending_info() {
     assert_eq!(count, 2);
     assert_eq!(min.as_deref(), Some("2-1"));
     assert_eq!(max.as_deref(), Some("3-1"));
-    assert_eq!(consumers.unwrap(), vec![("c1".to_string(), "2".to_string())]);
+    assert_eq!(
+        consumers.unwrap(),
+        vec![("c1".to_string(), "2".to_string())]
+    );
 
     // XINFO GROUPS -> one group, pending == 2.
     let groups: Vec<HashMap<String, Value>> = redis::cmd("XINFO")
@@ -115,10 +123,7 @@ async fn group_create_read_ack_pending_info() {
         .await
         .expect("xinfo groups");
     assert_eq!(groups.len(), 1);
-    assert_eq!(
-        String::from_redis_value(&groups[0]["name"]).unwrap(),
-        "grp"
-    );
+    assert_eq!(String::from_redis_value(&groups[0]["name"]).unwrap(), "grp");
     assert_eq!(i64::from_redis_value(&groups[0]["pending"]).unwrap(), 2);
 
     // XINFO STREAM -> length 3, last id 3-1.

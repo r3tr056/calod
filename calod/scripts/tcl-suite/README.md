@@ -70,7 +70,7 @@ Known caveats for these suites when pointed at an external server:
 | `unit/other` (persistence parts), `unit/dump` | BGSAVE/SAVE, DEBUG JMAP-equivalents, DEBUG RELOAD | M3 |
 | `unit/acl`, `unit/auth` | ACL engine, AUTH user/pass | M5 |
 | `unit/tls` | TLS listener | M5 |
-| `unit/functions`, `unit/scripting` | FUNCTION family, Lua hardening | M6 |
+| `unit/functions`, `unit/scripting` | Lua scripting / FUNCTION family removed from the product | not planned |
 | `unit/pubsub`, `unit/pubsubshard` | pub/sub + sharded pub/sub | M6 |
 | `unit/slowlog`, `unit/latency-monitor`, `unit/info` (full) | SLOWLOG/LATENCY, INFO completeness | M7 |
 | `integration/replication*`, `unit/wait`, `integration/failover` | replication, partial resync, WAIT | M8 |

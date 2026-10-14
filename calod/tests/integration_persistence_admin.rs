@@ -34,7 +34,12 @@ impl Ctx {
     async fn exec(&self, cmd: Command) -> Value {
         let raw = self
             .store
-            .execute(cmd, self.active.clone(), self.conn.clone(), ConnCtx::default())
+            .execute(
+                cmd,
+                self.active.clone(),
+                self.conn.clone(),
+                ConnCtx::default(),
+            )
             .await;
         let (v, n) = RESPParser::parse_value(&raw).expect("valid RESP");
         assert_eq!(n, raw.len(), "trailing bytes in reply");
@@ -171,8 +176,9 @@ async fn save_updates_lastsave() {
     };
     assert!(after >= before);
 
-    // The snapshot files exist on disk.
-    assert!(dir.join("shard_0.bin").exists());
+    // The snapshot manifest exists on disk. (No keys were written, so no
+    // per-DB shard directories — empty DBs are skipped by design.)
+    assert!(dir.join("manifest.json").exists());
 
     let _ = fs::remove_dir_all(&dir);
 }

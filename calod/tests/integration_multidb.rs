@@ -22,9 +22,17 @@ async fn databases_are_isolated() {
         .unwrap();
 
     // The key set in db1 is invisible in db0.
-    let in0: Option<String> = redis::cmd("GET").arg("k").query_async(&mut db0).await.unwrap();
+    let in0: Option<String> = redis::cmd("GET")
+        .arg("k")
+        .query_async(&mut db0)
+        .await
+        .unwrap();
     assert_eq!(in0, None);
-    let in1: Option<String> = redis::cmd("GET").arg("k").query_async(&mut db1).await.unwrap();
+    let in1: Option<String> = redis::cmd("GET")
+        .arg("k")
+        .query_async(&mut db1)
+        .await
+        .unwrap();
     assert_eq!(in1.as_deref(), Some("v1"));
 
     // A same-named key in db0 is independent.
@@ -34,9 +42,17 @@ async fn databases_are_isolated() {
         .query_async(&mut db0)
         .await
         .unwrap();
-    let in0: String = redis::cmd("GET").arg("k").query_async(&mut db0).await.unwrap();
+    let in0: String = redis::cmd("GET")
+        .arg("k")
+        .query_async(&mut db0)
+        .await
+        .unwrap();
     assert_eq!(in0, "v0");
-    let in1: String = redis::cmd("GET").arg("k").query_async(&mut db1).await.unwrap();
+    let in1: String = redis::cmd("GET")
+        .arg("k")
+        .query_async(&mut db1)
+        .await
+        .unwrap();
     assert_eq!(in1, "v1");
 
     // DBSIZE is per-database.
@@ -58,21 +74,45 @@ async fn select_switches_db_within_a_connection() {
         .expect("connect");
 
     // Commands are awaited sequentially so the SELECT applies to what follows.
-    let ok: String = redis::cmd("SELECT").arg(2).query_async(&mut conn).await.unwrap();
+    let ok: String = redis::cmd("SELECT")
+        .arg(2)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
     assert_eq!(ok, "OK");
-    let _: () = redis::cmd("SET").arg("x").arg("two").query_async(&mut conn).await.unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("x")
+        .arg("two")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
 
-    let _: String = redis::cmd("SELECT").arg(0).query_async(&mut conn).await.unwrap();
-    let in0: Option<String> = redis::cmd("GET").arg("x").query_async(&mut conn).await.unwrap();
+    let _: String = redis::cmd("SELECT")
+        .arg(0)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let in0: Option<String> = redis::cmd("GET")
+        .arg("x")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
     assert_eq!(in0, None);
 
-    let _: String = redis::cmd("SELECT").arg(2).query_async(&mut conn).await.unwrap();
-    let in2: String = redis::cmd("GET").arg("x").query_async(&mut conn).await.unwrap();
+    let _: String = redis::cmd("SELECT")
+        .arg(2)
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    let in2: String = redis::cmd("GET")
+        .arg("x")
+        .query_async(&mut conn)
+        .await
+        .unwrap();
     assert_eq!(in2, "two");
 
     // Out-of-range SELECT errors (default is 16 databases: valid 0..=15).
-    let bad: redis::RedisResult<String> =
-        redis::cmd("SELECT").arg(99).query_async(&mut conn).await;
+    let bad: redis::RedisResult<String> = redis::cmd("SELECT").arg(99).query_async(&mut conn).await;
     assert!(bad.is_err());
 
     server.shutdown().await;
@@ -102,9 +142,17 @@ async fn move_transfers_key_across_dbs() {
     assert_eq!(moved, 1);
 
     // Gone from db0, present in db1.
-    let in0: Option<String> = redis::cmd("GET").arg("mk").query_async(&mut db0).await.unwrap();
+    let in0: Option<String> = redis::cmd("GET")
+        .arg("mk")
+        .query_async(&mut db0)
+        .await
+        .unwrap();
     assert_eq!(in0, None);
-    let in1: String = redis::cmd("GET").arg("mk").query_async(&mut db1).await.unwrap();
+    let in1: String = redis::cmd("GET")
+        .arg("mk")
+        .query_async(&mut db1)
+        .await
+        .unwrap();
     assert_eq!(in1, "payload");
 
     // MOVE again from db0 (no longer there) returns 0.
@@ -127,8 +175,18 @@ async fn flushdb_is_scoped_flushall_is_global() {
     let mut db0 = c0.get_multiplexed_async_connection().await.expect("db0");
     let mut db1 = c1.get_multiplexed_async_connection().await.expect("db1");
 
-    let _: () = redis::cmd("SET").arg("a").arg("1").query_async(&mut db0).await.unwrap();
-    let _: () = redis::cmd("SET").arg("b").arg("2").query_async(&mut db1).await.unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("a")
+        .arg("1")
+        .query_async(&mut db0)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("b")
+        .arg("2")
+        .query_async(&mut db1)
+        .await
+        .unwrap();
 
     // FLUSHDB on db0 leaves db1 intact.
     let _: String = redis::cmd("FLUSHDB").query_async(&mut db0).await.unwrap();
