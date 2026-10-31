@@ -20,6 +20,7 @@ from . import context
 from .canonical import canonical_dumps
 from .client import (
     DEFAULT_BASE_URL,
+    RETRYABLE_STATUSES,
     _normalize_base_url,
     _parse_page,
     _raise_for_problem,
@@ -33,7 +34,15 @@ from .decorator import (
     derive_idempotency_key,
 )
 from .exceptions import CalodError, EffectWaitTimeout, OutcomeUnknown
-from .models import Effect, EffectDecision, Event, Page, Run
+from .models import (
+    Effect,
+    EffectDecision,
+    Event,
+    Page,
+    RetentionReport,
+    Run,
+    RunExport,
+)
 
 F = TypeVar("F", bound=Callable[..., Any])
 
@@ -47,10 +56,15 @@ class SyncCalodClient:
         api_key: str = "",
         *,
         timeout: float = 30.0,
+        retries: int = 2,
+        retry_backoff_seconds: float = 0.2,
         http_client: Optional[httpx.Client] = None,
     ) -> None:
         self._base = _normalize_base_url(base_url)
         self._api_key = api_key
+        self._timeout = timeout
+        self._retries = max(0, retries)
+        self._retry_backoff = retry_backoff_seconds
         self._owns_client = http_client is None
         self._http = http_client or httpx.Client(timeout=timeout)
 
@@ -76,19 +90,42 @@ class SyncCalodClient:
         hdrs = {"X-Calod-Key": self._api_key}
         if headers:
             hdrs.update(headers)
-        response = self._http.request(
-            method,
-            f"{self._base}{path}",
-            content=(
-                canonical_dumps(json_body).encode("utf-8") if json_body is not None else None
-            ),
-            headers=(
-                {**hdrs, "Content-Type": "application/json"}
-                if json_body is not None
-                else hdrs
-            ),
-            params={k: v for k, v in (params or {}).items() if v is not None},
-        )
+        # Same retry policy as the async client (see CalodClient).
+        idempotent = method == "GET" or (method == "POST" and path in ("/v1/effects", "/v1/runs"))
+        attempt = 0
+        while True:
+            try:
+                response = self._http.request(
+                    method,
+                    f"{self._base}{path}",
+                    content=(
+                        canonical_dumps(json_body).encode("utf-8")
+                        if json_body is not None
+                        else None
+                    ),
+                    headers=(
+                        {**hdrs, "Content-Type": "application/json"}
+                        if json_body is not None
+                        else hdrs
+                    ),
+                    params={k: v for k, v in (params or {}).items() if v is not None},
+                    timeout=self._timeout,
+                )
+            except httpx.TransportError:
+                if not (idempotent and attempt < self._retries):
+                    raise
+                time.sleep(self._retry_backoff * (2**attempt))
+                attempt += 1
+                continue
+            if (
+                response.status_code in RETRYABLE_STATUSES
+                and idempotent
+                and attempt < self._retries
+            ):
+                time.sleep(self._retry_backoff * (2**attempt))
+                attempt += 1
+                continue
+            break
         if response.status_code >= 400:
             _raise_for_problem(response)
         return response
@@ -103,6 +140,9 @@ class SyncCalodClient:
 
     def version(self) -> dict[str, Any]:
         return self._request("GET", "/v1/version").json()
+
+    def metrics(self) -> str:
+        return self._request("GET", "/metrics").text
 
     # -- runs -----------------------------------------------------------------
 
@@ -147,6 +187,30 @@ class SyncCalodClient:
             },
         )
         return _parse_page(response.json(), Event.from_dict)
+
+    def export_run(self, run_id: str, *, format: str = "json"):
+        """Synchronous variant of `CalodClient.export_run`."""
+        if format not in ("json", "csv"):
+            raise ValueError("format must be 'json' or 'csv'")
+        response = self._request(
+            "GET", f"/v1/runs/{run_id}/export", params={"format": format}
+        )
+        if format == "csv":
+            return response.text
+        return RunExport.from_dict(response.json())
+
+    def apply_retention(
+        self,
+        *,
+        max_age_days: Optional[int] = None,
+        compact: bool = True,
+    ) -> RetentionReport:
+        """Synchronous variant of `CalodClient.apply_retention`."""
+        body: dict[str, Any] = {"compact": compact}
+        if max_age_days is not None:
+            body["max_age_days"] = max_age_days
+        response = self._request("POST", "/v1/admin/retention", json_body=body)
+        return RetentionReport.from_dict(response.json())
 
     # -- effects ---------------------------------------------------------------
 

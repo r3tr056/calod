@@ -18,6 +18,7 @@ header (for effects the ETag is the quoted fencing token).
 
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Any, Callable, Optional
 
@@ -25,7 +26,18 @@ import httpx
 
 from .canonical import canonical_dumps
 from .exceptions import CalodError, EffectConflict, LeaseLost
-from .models import Effect, EffectDecision, Event, Page, Run
+from .models import (
+    Effect,
+    EffectDecision,
+    Event,
+    Page,
+    RetentionReport,
+    Run,
+    RunExport,
+)
+
+#: Statuses worth retrying for idempotent requests (never 4xx/409).
+RETRYABLE_STATUSES = frozenset({502, 503, 504})
 
 DEFAULT_BASE_URL = "http://127.0.0.1:7379"
 
@@ -75,7 +87,16 @@ class CalodClient:
     api_key:
         Project API key (``cld_...``), sent as ``X-Calod-Key``.
     timeout:
-        Per-request timeout in seconds.
+        Per-request timeout in seconds. Applied to every request,
+        including when ``http_client`` is supplied (it overrides that
+        client's default timeout per request).
+    retries:
+        Extra attempts for idempotent requests (GETs, effect/run
+        creation) on transport errors or 502/503/504. Default 2.
+        Non-idempotent transitions and all 4xx/409 responses are
+        never retried. Set 0 to disable.
+    retry_backoff_seconds:
+        Base backoff between retries (doubles each attempt).
     http_client:
         Optional pre-configured ``httpx.AsyncClient`` (the caller owns its
         lifecycle; ``aclose`` will not close it).
@@ -87,10 +108,15 @@ class CalodClient:
         api_key: str = "",
         *,
         timeout: float = 30.0,
+        retries: int = 2,
+        retry_backoff_seconds: float = 0.2,
         http_client: Optional[httpx.AsyncClient] = None,
     ) -> None:
         self._base = _normalize_base_url(base_url)
         self._api_key = api_key
+        self._timeout = timeout
+        self._retries = max(0, retries)
+        self._retry_backoff = retry_backoff_seconds
         self._owns_client = http_client is None
         self._http = http_client or httpx.AsyncClient(timeout=timeout)
 
@@ -118,19 +144,43 @@ class CalodClient:
         hdrs = {"X-Calod-Key": self._api_key}
         if headers:
             hdrs.update(headers)
-        response = await self._http.request(
-            method,
-            f"{self._base}{path}",
-            content=(
-                canonical_dumps(json_body).encode("utf-8") if json_body is not None else None
-            ),
-            headers=(
-                {**hdrs, "Content-Type": "application/json"}
-                if json_body is not None
-                else hdrs
-            ),
-            params={k: v for k, v in (params or {}).items() if v is not None},
-        )
+        # Retries only where a retry cannot double-apply a change:
+        # reads, plus the two creations that carry an idempotency key.
+        idempotent = method == "GET" or (method == "POST" and path in ("/v1/effects", "/v1/runs"))
+        attempt = 0
+        while True:
+            try:
+                response = await self._http.request(
+                    method,
+                    f"{self._base}{path}",
+                    content=(
+                        canonical_dumps(json_body).encode("utf-8")
+                        if json_body is not None
+                        else None
+                    ),
+                    headers=(
+                        {**hdrs, "Content-Type": "application/json"}
+                        if json_body is not None
+                        else hdrs
+                    ),
+                    params={k: v for k, v in (params or {}).items() if v is not None},
+                    timeout=self._timeout,
+                )
+            except httpx.TransportError:
+                if not (idempotent and attempt < self._retries):
+                    raise
+                await asyncio.sleep(self._retry_backoff * (2**attempt))
+                attempt += 1
+                continue
+            if (
+                response.status_code in RETRYABLE_STATUSES
+                and idempotent
+                and attempt < self._retries
+            ):
+                await asyncio.sleep(self._retry_backoff * (2**attempt))
+                attempt += 1
+                continue
+            break
         if response.status_code >= 400:
             _raise_for_problem(response)
         return response
@@ -150,6 +200,10 @@ class CalodClient:
     async def version(self) -> dict[str, Any]:
         """API/server version info."""
         return (await self._request("GET", "/v1/version")).json()
+
+    async def metrics(self) -> str:
+        """Prometheus text exposition from `GET /metrics`."""
+        return (await self._request("GET", "/metrics")).text
 
     # -- runs -----------------------------------------------------------------
 
@@ -196,6 +250,35 @@ class CalodClient:
             },
         )
         return _parse_page(response.json(), Event.from_dict)
+
+    async def export_run(self, run_id: str, *, format: str = "json"):
+        """Export signed evidence for a run (Phase 1).
+
+        ``format="json"`` returns a :class:`RunExport` (bundle +
+        HMAC-signed manifest; verify with `scripts/verify_export.py`).
+        ``format="csv"`` returns the event timeline as CSV text.
+        """
+        if format not in ("json", "csv"):
+            raise ValueError("format must be 'json' or 'csv'")
+        response = await self._request(
+            "GET", f"/v1/runs/{run_id}/export", params={"format": format}
+        )
+        if format == "csv":
+            return response.text
+        return RunExport.from_dict(response.json())
+
+    async def apply_retention(
+        self,
+        *,
+        max_age_days: Optional[int] = None,
+        compact: bool = True,
+    ) -> RetentionReport:
+        """Apply retention pruning. Requires the `admin` key scope."""
+        body: dict[str, Any] = {"compact": compact}
+        if max_age_days is not None:
+            body["max_age_days"] = max_age_days
+        response = await self._request("POST", "/v1/admin/retention", json_body=body)
+        return RetentionReport.from_dict(response.json())
 
     # -- effects ---------------------------------------------------------------
 

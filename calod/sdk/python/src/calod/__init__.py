@@ -35,9 +35,12 @@ from .models import (
     EffectFailure,
     EffectLease,
     Event,
+    ExportManifest,
     ExternalReceipt,
     Page,
+    RetentionReport,
     Run,
+    RunExport,
 )
 
 __version__ = "0.1.0"
@@ -55,8 +58,11 @@ __all__ = [
     "ExternalReceipt",
     "LeaseLost",
     "OutcomeUnknown",
+    "ExportManifest",
     "Page",
+    "RetentionReport",
     "Run",
+    "RunExport",
     "__version__",
     "canonical_dumps",
     "configure",

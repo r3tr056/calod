@@ -174,6 +174,71 @@ class Event:
 
 
 @dataclass(frozen=True)
+class ExportManifest:
+    """Signed manifest of an evidence export (`GET /v1/runs/{id}/export`)."""
+
+    algorithm: str
+    bundle_sha256: str
+    signature: str
+    events_head_hash: Optional[str] = None
+    records: dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ExportManifest":
+        return cls(
+            algorithm=_expect_str(data.get("algorithm"), "manifest.algorithm"),
+            bundle_sha256=_expect_str(data.get("bundle_sha256"), "manifest.bundle_sha256"),
+            signature=_expect_str(data.get("signature"), "manifest.signature"),
+            events_head_hash=data.get("events_head_hash"),
+            records=dict(data.get("records") or {}),
+        )
+
+
+@dataclass(frozen=True)
+class RunExport:
+    """A signed evidence bundle for one run (Phase 1 export)."""
+
+    run: Run
+    effects: list[Effect]
+    events: list[Event]
+    manifest: ExportManifest
+    schema: str = ""
+    exported_at: str = ""
+    checkpoints: list[dict[str, Any]] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RunExport":
+        return cls(
+            run=Run.from_dict(data["run"]),
+            effects=[Effect.from_dict(item) for item in data.get("effects") or []],
+            events=[Event.from_dict(item) for item in data.get("events") or []],
+            manifest=ExportManifest.from_dict(data["manifest"]),
+            schema=str(data.get("schema", "")),
+            exported_at=str(data.get("exported_at", "")),
+            checkpoints=list(data.get("checkpoints") or []),
+        )
+
+
+@dataclass(frozen=True)
+class RetentionReport:
+    """Outcome of `POST /v1/admin/retention`."""
+
+    runs_removed: int = 0
+    effects_removed: int = 0
+    events_removed: int = 0
+    cutoff_ms: int = 0
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RetentionReport":
+        return cls(
+            runs_removed=int(data.get("runs_removed") or 0),
+            effects_removed=int(data.get("effects_removed") or 0),
+            events_removed=int(data.get("events_removed") or 0),
+            cutoff_ms=int(data.get("cutoff_ms") or 0),
+        )
+
+
+@dataclass(frozen=True)
 class Page(Generic[T]):
     """A cursor-paginated list response."""
 
