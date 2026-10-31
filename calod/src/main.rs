@@ -99,6 +99,27 @@ struct Cli {
     /// Start with an EMPTY store if snapshot/AOF recovery fails (data loss)
     #[clap(long)]
     allow_data_loss: bool,
+
+    /// Create an API key for the REST ledger API, print its one-time
+    /// secret, and exit (does not start the server). Run this once
+    /// against a stopped server (or before first start) to provision
+    /// the first key; the server must be restarted afterwards if it
+    /// was already running with an empty key store.
+    #[clap(long)]
+    create_api_key: bool,
+
+    /// Tenant for --create-api-key [default: default]
+    #[clap(long)]
+    tenant: Option<String>,
+
+    /// Project for --create-api-key [default: default]
+    #[clap(long)]
+    project: Option<String>,
+
+    /// Comma-separated scopes for --create-api-key
+    /// [default: effects:read,effects:write,effects:reconcile]
+    #[clap(long)]
+    scopes: Option<String>,
 }
 
 fn print_banner(host: &str, port: u16, auth_enabled: bool, tls_enabled: bool) {
@@ -151,6 +172,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let resolved = resolve_config(&overrides, &|name| std::env::var(name).ok())?;
     let config = resolved.config;
+
+    // One-shot provisioning: create a REST API key in the store at the
+    // configured snapshot directory, print the one-time secret, exit.
+    if args.create_api_key {
+        use calod::store::api_keys::ApiKeyStore;
+        use std::collections::BTreeSet;
+
+        let tenant = args.tenant.as_deref().unwrap_or("default");
+        let project = args.project.as_deref().unwrap_or("default");
+        let scopes: BTreeSet<String> = args
+            .scopes
+            .as_deref()
+            .unwrap_or("effects:read,effects:write,effects:reconcile")
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        std::fs::create_dir_all(&config.persistence.snapshot_dir)?;
+        let store = ApiKeyStore::open(&config.persistence.snapshot_dir)?;
+        let (metadata, secret) = store.create(tenant, project, scopes, None)?;
+        println!("API key created (save the secret now; it is shown only once):");
+        println!("  key id:  {}", metadata.id);
+        println!("  tenant:  {}", metadata.tenant_id);
+        println!("  project: {}", metadata.project_id);
+        println!("  secret:  {}", secret);
+        return Ok(());
+    }
 
     println!(
         "config: file={}, {} overrides from env, {} from CLI",
@@ -258,10 +306,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if config.api.enabled {
         let ledger_dir = config.api.ledger_data_dir(&config.persistence);
         let durability = config.api.ledger_durability(&config.persistence);
-        let ledger =
-            calod_api::open_ledger(&ledger_dir, durability, config.allow_data_loss).await?;
+        let retention = config
+            .api
+            .retention_max_age_days
+            .map(|days| calod_api::RetentionPolicy {
+                max_age_ms: (days * 86_400_000) as i64,
+            });
+        let ledger = calod_api::open_ledger_with_retention(
+            &ledger_dir,
+            durability,
+            config.allow_data_loss,
+            retention,
+        )
+        .await?;
+        if config.api.retention_apply_on_startup {
+            match ledger.apply_configured_retention().await {
+                Ok(report) => tracing::info!(
+                    "retention on startup: {} runs, {} effects, {} events pruned (cutoff {})",
+                    report.runs_removed,
+                    report.effects_removed,
+                    report.events_removed,
+                    report.cutoff_ms
+                ),
+                Err(err) => tracing::error!("retention on startup failed: {}", err),
+            }
+        }
+        let export_key = calod_api::load_or_create_export_key(&ledger_dir)
+            .map_err(|e| format!("export signing key: {e}"))?;
         let api_state =
-            calod_api::AppState::new(ledger.clone(), pool.store().api_key_store(), VERSION);
+            calod_api::AppState::new(ledger.clone(), pool.store().api_key_store(), VERSION)
+                .with_export_key(export_key);
         let api_listener = bind_listener(config.api.listen_addr, &config)?;
         let api_tls = tls_acceptor.clone();
         let mut api_shutdown = shutdown_tx.subscribe();

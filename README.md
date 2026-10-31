@@ -46,11 +46,11 @@ Calod's core is a data store written in Rust, inspired by the Redis protocol and
 
 ```bash
 git clone https://github.com/r3tr056/calod.git
-cd calod
+cd calod/calod
 cargo build --release
 ```
 
-The compiled binary will be located at `target/release/calod`.
+The compiled binary will be located at `calod/target/release/calod` (relative to the repo root). The server is a Cargo workspace in the `calod/` directory (root package plus `crates/calod-core`, `calod-resp`, `calod-storage`, `calod-ledger`, `calod-api`): build from `calod/`, as above.
 
 ### Run Calod Server
 
@@ -58,7 +58,22 @@ The compiled binary will be located at `target/release/calod`.
 target/release/calod
 ```
 
-Calod server will start listening on `127.0.0.1:6379` by default.
+One process serves both interfaces: the ledger REST API (the product API) on `127.0.0.1:7379` and RESP (frozen Redis-compatible inspection interface) on `127.0.0.1:6379`. Configuration is CLI flags > `CALOD_*` env vars > `calod.toml` > defaults (see `calod/src/config.rs`); data lives under `./data` by default.
+
+### Create an API key and call the ledger API
+
+Ledger endpoints require an `X-Calod-Key` header. Provision the first key once, before starting the server (the secret is shown only once), then start the server:
+
+```bash
+cd calod/calod
+./target/release/calod --create-api-key
+#   secret:  cld_...   <- save this
+./target/release/calod &
+curl -s http://127.0.0.1:7379/v1/health/ready
+curl -s -X POST http://127.0.0.1:7379/v1/effects -H "X-Calod-Key: cld_..." -H "Idempotency-Key: order-123:charge" -H "Content-Type: application/json" -d '{"scope":"order-123","tool_name":"charge_card","input":{"amount_minor":5000}}'
+```
+
+The first caller gets `execute` with a lease; a retry with the same `Idempotency-Key` and input replays the recorded receipt instead of executing again. Full contract: `calod/docs/openapi.yaml`. Python SDK: `calod/sdk/python/`.
 
 ### Connect with a Redis Client (Python Example)
 

@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [dev, main, v1-implementation]
+    branches: [dev, main]
   pull_request:
 
 env:
@@ -44,6 +44,33 @@ jobs:
           workspaces: calod
       - name: cargo test
         run: cargo test --all-targets
+
+  docker-build:
+    name: docker build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t calod:ci calod
+
+  python-sdk:
+    name: python SDK tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install SDK with dev extras
+        run: pip install -e "calod/sdk/python[dev]"
+      - name: Run SDK tests
+        run: pytest calod/sdk/python/tests -q
 
   openapi-lint:
     name: OpenAPI lint
