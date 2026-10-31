@@ -52,13 +52,13 @@ mod snapshot;
 pub use clock::{Clock, ManualClock, SystemClock};
 pub use digest::{canonical_json, input_digest, sha256_digest, GENESIS_HASH};
 pub use error::{LedgerError, Result};
-pub use ledger::{Ledger, LedgerConfig, DEFAULT_PARTITIONS};
+pub use ledger::{Ledger, LedgerConfig, LedgerStats, DEFAULT_PARTITIONS};
 pub use model::{
     verify_event_chain, AcquireEffectRequest, AppendEventRequest, CallerCapabilities, Checkpoint,
     CheckpointList, CreateCheckpointRequest, CreateRunRequest, CursorPage, Effect, EffectDecision,
     EffectDecisionType, EffectFailure, EffectFilter, EffectLease, EffectList, EffectState,
     EffectStatus, EffectTransition, Event, EventFilter, EventList, ExternalReceipt, ForkRunRequest,
-    Run, RunFilter, RunList, RunStatus, Scope, UpdateEffectRequest, UpdateRunRequest,
-    SCHEMA_VERSION,
+    RetentionPolicy, RetentionReport, Run, RunExport, RunFilter, RunList, RunStatus, Scope,
+    UpdateEffectRequest, UpdateRunRequest, SCHEMA_VERSION,
 };
 pub use snapshot::LedgerSnapshotManifest;

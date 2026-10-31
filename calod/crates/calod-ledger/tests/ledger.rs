@@ -87,12 +87,14 @@ fn commit_req(lease_token: String, fencing_token: i64, result: Value) -> UpdateE
 fn no_caps() -> CallerCapabilities {
     CallerCapabilities {
         can_reconcile: false,
+        can_admin: false,
     }
 }
 
 fn reconcile_caps() -> CallerCapabilities {
     CallerCapabilities {
         can_reconcile: true,
+        can_admin: false,
     }
 }
 

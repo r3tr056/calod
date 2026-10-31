@@ -12,7 +12,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{error, info, warn};
 
 use calod_core::store::config::FsyncStrategy;
-use calod_ledger::{Ledger, LedgerConfig, LedgerError, SystemClock};
+use calod_ledger::{Ledger, LedgerConfig, LedgerError, RetentionPolicy, SystemClock};
 use calod_storage::wal::WalConfig;
 
 use crate::routes::{router, AppState};
@@ -26,7 +26,17 @@ pub async fn open_ledger(
     durability: FsyncStrategy,
     allow_data_loss: bool,
 ) -> Result<Arc<Ledger>, LedgerError> {
-    match try_open(data_dir, durability.clone()).await {
+    open_ledger_with_retention(data_dir, durability, allow_data_loss, None).await
+}
+
+/// [`open_ledger`] with a retention policy (Phase 1).
+pub async fn open_ledger_with_retention(
+    data_dir: &Path,
+    durability: FsyncStrategy,
+    allow_data_loss: bool,
+    retention: Option<RetentionPolicy>,
+) -> Result<Arc<Ledger>, LedgerError> {
+    match try_open(data_dir, durability.clone(), retention).await {
         Ok(ledger) => Ok(ledger),
         Err(err) => {
             if allow_data_loss {
@@ -37,7 +47,7 @@ pub async fn open_ledger(
                     err
                 );
                 quarantine_dir(data_dir)?;
-                try_open(data_dir, durability).await
+                try_open(data_dir, durability, retention).await
             } else {
                 error!(
                     "Ledger recovery failed, refusing to start (set `allow_data_loss` / \
@@ -50,9 +60,15 @@ pub async fn open_ledger(
     }
 }
 
-async fn try_open(data_dir: &Path, durability: FsyncStrategy) -> Result<Arc<Ledger>, LedgerError> {
+async fn try_open(
+    data_dir: &Path,
+    durability: FsyncStrategy,
+    retention: Option<RetentionPolicy>,
+) -> Result<Arc<Ledger>, LedgerError> {
     let wal = WalConfig::new(data_dir.join("wal")).with_fsync_strategy(durability);
-    let config = LedgerConfig::new(data_dir).with_wal_config(wal);
+    let config = LedgerConfig::new(data_dir)
+        .with_wal_config(wal)
+        .with_retention(retention);
     Ledger::open(config, Arc::new(SystemClock))
         .await
         .map(Arc::new)

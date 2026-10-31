@@ -68,6 +68,20 @@ impl EffectStatus {
         }
     }
 
+    /// States retention may prune once old enough: the outcome is
+    /// final and nothing can transition further. `FailedRetryable`
+    /// (reacquirable) and `OutcomeUnknown` (must be reconciled) are
+    /// never retention-terminal.
+    pub fn is_retention_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Committed
+                | Self::FailedTerminal
+                | Self::ReconciledCommitted
+                | Self::ReconciledFailed
+        )
+    }
+
     /// Wire name, for events and error messages.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -371,6 +385,8 @@ pub struct UpdateEffectRequest {
 pub struct CallerCapabilities {
     /// Whether the caller may perform reconcile transitions.
     pub can_reconcile: bool,
+    /// Whether the caller may perform admin operations (retention).
+    pub can_admin: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -812,4 +828,44 @@ pub struct EventFilter {
     pub event_type: Option<String>,
     /// Only events with sequence strictly greater than this.
     pub after_sequence: Option<i64>,
+}
+
+// ---------------------------------------------------------------------------
+// Retention and export (Phase 1)
+// ---------------------------------------------------------------------------
+
+/// Retention policy: prune retention-terminal effects and terminal
+/// runs whose last update is older than `max_age_ms` relative to now.
+/// `None` disables retention entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionPolicy {
+    /// Maximum age (ms) of terminal data before it may be pruned.
+    pub max_age_ms: i64,
+}
+
+/// Outcome of one retention application.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionReport {
+    /// Terminal runs removed (with their events and checkpoints).
+    pub runs_removed: u64,
+    /// Terminal effects removed.
+    pub effects_removed: u64,
+    /// Run events removed with their runs.
+    pub events_removed: u64,
+    /// The cutoff applied (ms since epoch); data updated at or
+    /// before this instant was eligible.
+    pub cutoff_ms: i64,
+}
+
+/// Everything an evidence export needs for one run, in API views.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunExport {
+    /// The run.
+    pub run: Run,
+    /// Effects owned by the run, oldest first.
+    pub effects: Vec<Effect>,
+    /// The run's hash-chained timeline, in sequence order.
+    pub events: Vec<Event>,
+    /// The run's checkpoints, oldest first.
+    pub checkpoints: Vec<Checkpoint>,
 }

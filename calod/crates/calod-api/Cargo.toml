@@ -11,6 +11,7 @@ calod-storage = { path = "../calod-storage" }
 chrono = { version = "0.4", default-features = false, features = ["std", "alloc"] }
 serde = { version = "1.0.215", features = ["derive"] }
 serde_json = "1.0.132"
+sha2 = "0.10"
 serde_urlencoded = "0.7"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }

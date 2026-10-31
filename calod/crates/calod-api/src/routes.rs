@@ -17,13 +17,14 @@ use serde_json::{json, Value};
 use calod_core::store::api_keys::ApiKeyStore;
 use calod_ledger::{
     AppendEventRequest, CreateCheckpointRequest, CreateRunRequest, EffectDecisionType,
-    EffectFilter, EffectState, EventFilter, ForkRunRequest, Ledger, RunFilter, RunStatus,
-    UpdateEffectRequest, UpdateRunRequest,
+    EffectFilter, EffectState, EventFilter, ForkRunRequest, Ledger, RetentionPolicy, RunFilter,
+    RunStatus, UpdateEffectRequest, UpdateRunRequest,
 };
 
 use crate::auth::{AuthContext, RECONCILE_SCOPE};
 use crate::context::{self, RequestContext};
 use crate::error::ApiError;
+use crate::export;
 use crate::extract::{
     etag, parse_query, parse_rfc3339_ms, parse_uuid_path, IdempotencyKey, IfMatch, LimitedJson,
 };
@@ -34,6 +35,7 @@ pub struct AppState {
     ledger: Arc<Ledger>,
     api_keys: Arc<ApiKeyStore>,
     server_version: Arc<str>,
+    export_key: Arc<Vec<u8>>,
 }
 
 impl AppState {
@@ -44,11 +46,25 @@ impl AppState {
         api_keys: Arc<ApiKeyStore>,
         server_version: impl Into<Arc<str>>,
     ) -> Self {
+        // Ephemeral export signing key unless `with_export_key`
+        // installs the persisted one; signatures from an ephemeral
+        // key cannot be verified after a restart.
+        let mut ephemeral = Vec::with_capacity(32);
+        ephemeral.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+        ephemeral.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
         Self {
             ledger,
             api_keys,
             server_version: server_version.into(),
+            export_key: Arc::new(ephemeral),
         }
+    }
+
+    /// Install the persisted export signing key (see
+    /// [`crate::export::load_or_create_export_key`]).
+    pub fn with_export_key(mut self, key: Vec<u8>) -> Self {
+        self.export_key = Arc::new(key);
+        self
     }
 
     /// The scoped API-key store used for `X-Calod-Key` verification.
@@ -75,6 +91,9 @@ pub fn router(state: AppState) -> Router {
             "/v1/runs/{run_id}/checkpoints",
             post(create_checkpoint).get(list_checkpoints),
         )
+        .route("/v1/runs/{run_id}/export", get(export_run))
+        .route("/v1/admin/retention", post(apply_retention))
+        .route("/metrics", get(metrics))
         .route("/v1/effects", post(acquire_effect).get(list_effects))
         .route(
             "/v1/effects/{effect_id}",
@@ -145,6 +164,167 @@ async fn version(State(state): State<AppState>) -> impl IntoResponse {
         }),
         &[],
     )
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ExportQuery {
+    format: Option<String>,
+}
+
+/// `GET /v1/runs/{run_id}/export?format=json|csv` — signed evidence
+/// export (Phase 1). JSON is the full bundle with an HMAC-signed
+/// manifest; CSV is the event timeline with digest/signature in
+/// response headers.
+async fn export_run(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
+    auth: AuthContext,
+    Path(raw_id): Path<String>,
+    uri: Uri,
+) -> ApiResult {
+    let run_id = parse_uuid_path(&ctx, "run_id", &raw_id)?;
+    let query: ExportQuery = parse_query(&ctx, &uri)?;
+    let export = state
+        .ledger
+        .export_run(&auth.scope, run_id)
+        .await
+        .map_err(|err| ApiError::from_ledger(&ctx, err))?;
+    match query.format.as_deref().unwrap_or("json") {
+        "json" => {
+            let exported_at = {
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                chrono::DateTime::from_timestamp(secs, 0)
+                    .map(|dt| dt.to_rfc3339())
+                    .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string())
+            };
+            let bundle = export::render_json_export(&export, &state.export_key, &exported_at);
+            Ok(respond(StatusCode::OK, &bundle, &[]))
+        }
+        "csv" => {
+            let csv = export::render_events_csv(&export);
+            let (digest, signature) = export::csv_manifest(&csv, &state.export_key);
+            let builder = Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/csv")
+                .header("X-Calod-Bundle-Sha256", digest)
+                .header("X-Calod-Export-Signature", signature);
+            builder
+                .body(Body::from(csv))
+                .map_err(|_| ApiError::service_unavailable(&ctx, "export render failed"))
+        }
+        other => Err(ApiError::validation(
+            &ctx,
+            "format",
+            format!("unsupported export format '{other}' (expected json or csv)"),
+        )),
+    }
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct RetentionBody {
+    max_age_days: Option<u64>,
+    #[serde(default = "default_true")]
+    compact: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// `POST /v1/admin/retention` — apply retention (requires the
+/// `admin` key scope), then snapshot to compact the WAL when
+/// `compact` is set. Prunes across all tenants; handle with care.
+async fn apply_retention(
+    State(state): State<AppState>,
+    Extension(ctx): Extension<RequestContext>,
+    auth: AuthContext,
+    LimitedJson(req): LimitedJson<RetentionBody>,
+) -> ApiResult {
+    if !auth.capabilities.can_admin {
+        return Err(ApiError::insufficient_scope(
+            &ctx,
+            "retention requires the admin API-key scope",
+        ));
+    }
+    let policy = match req.max_age_days {
+        Some(days) => RetentionPolicy {
+            max_age_ms: (days * 86_400_000) as i64,
+        },
+        None => state.ledger.retention_policy().ok_or_else(|| {
+            ApiError::validation(
+                &ctx,
+                "max_age_days",
+                "no retention policy configured; supply max_age_days",
+            )
+        })?,
+    };
+    let report = state
+        .ledger
+        .apply_retention(policy)
+        .await
+        .map_err(|err| ApiError::from_ledger(&ctx, err))?;
+    if req.compact && (report.runs_removed > 0 || report.effects_removed > 0) {
+        state
+            .ledger
+            .snapshot()
+            .await
+            .map_err(|err| ApiError::from_ledger(&ctx, err))?;
+    }
+    Ok(respond(StatusCode::OK, &report, &[]))
+}
+
+/// `GET /metrics` — Prometheus text exposition for the ledger and
+/// API (unauthenticated, like the health endpoints).
+async fn metrics(State(state): State<AppState>) -> impl IntoResponse {
+    let stats = state.ledger.stats();
+    let mut out = String::new();
+    out.push_str(
+        "# HELP calod_api_up API server is up.\n# TYPE calod_api_up gauge\ncalod_api_up 1\n",
+    );
+    let counters = [
+        ("execute", stats.acquires_execute),
+        ("replay", stats.acquires_replay),
+        ("wait", stats.acquires_wait),
+        ("reconcile", stats.acquires_reconcile),
+    ];
+    out.push_str("# HELP calod_acquires_total Effect acquires by decision.\n# TYPE calod_acquires_total counter\n");
+    for (decision, value) in counters {
+        out.push_str(&format!(
+            "calod_acquires_total{{decision=\"{decision}\"}} {value}\n"
+        ));
+    }
+    out.push_str(&format!(
+        "# HELP calod_transitions_total Successful effect transitions.\n# TYPE calod_transitions_total counter\ncalod_transitions_total {}\n",
+        stats.transitions_total
+    ));
+    out.push_str(&format!(
+        "# HELP calod_retention_removed_total Records removed by retention.\n# TYPE calod_retention_removed_total counter\ncalod_retention_removed_total{{kind=\"runs\"}} {}\ncalod_retention_removed_total{{kind=\"effects\"}} {}\n",
+        stats.retention_runs_removed, stats.retention_effects_removed
+    ));
+    out.push_str(&format!(
+        "# HELP calod_runs_current Runs currently indexed.\n# TYPE calod_runs_current gauge\ncalod_runs_current {}\n",
+        stats.runs_current
+    ));
+    out.push_str(
+        "# HELP calod_effects_current Effects currently indexed by state.\n# TYPE calod_effects_current gauge\n",
+    );
+    for (state_name, value) in &stats.effects_by_state {
+        out.push_str(&format!(
+            "calod_effects_current{{state=\"{state_name}\"}} {value}\n"
+        ));
+    }
+    out.push_str(&format!(
+        "# HELP calod_events_current Events currently indexed.\n# TYPE calod_events_current gauge\ncalod_events_current {}\n",
+        stats.events_current
+    ));
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/plain; version=0.0.4")
+        .body(Body::from(out))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
 /// Fallback: unknown routes are 404 problems, not empty 404s.

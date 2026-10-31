@@ -30,12 +30,15 @@
 mod auth;
 mod context;
 mod error;
+mod export;
 mod extract;
 mod routes;
 mod server;
 
 pub use auth::AuthContext;
+pub use calod_ledger::RetentionPolicy;
 pub use context::RequestContext;
 pub use error::ApiError;
+pub use export::load_or_create_export_key;
 pub use routes::{router, AppState};
-pub use server::{open_ledger, serve};
+pub use server::{open_ledger, open_ledger_with_retention, serve};

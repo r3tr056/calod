@@ -27,6 +27,7 @@
 //!   (`always|everysec|no`), `CALOD_PERSISTENCE__AOF_REWRITE_ENABLED`,
 //!   `CALOD_PERSISTENCE__AOF_REWRITE_PERCENTAGE`,
 //!   `CALOD_PERSISTENCE__AOF_REWRITE_MIN_SIZE_MB`
+//! - `CALOD_API__RETENTION_MAX_AGE_DAYS`, `CALOD_API__RETENTION_APPLY_ON_STARTUP`,
 //! - `CALOD_API__ENABLED`, `CALOD_API__LISTEN_ADDR`, `CALOD_API__DATA_DIR`,
 //!   `CALOD_API__DURABILITY` (`always|everysec|no`; defaults to the AOF fsync
 //!   strategy)
@@ -357,6 +358,20 @@ fn apply_env_overrides(
     n += env_bool(env, "CALOD_API__ENABLED", &mut api.enabled)?;
     n += env_parse(env, "CALOD_API__LISTEN_ADDR", &mut api.listen_addr)?;
     n += env_opt_path(env, "CALOD_API__DATA_DIR", &mut api.data_dir)?;
+    if let Some(v) = env("CALOD_API__RETENTION_MAX_AGE_DAYS") {
+        api.retention_max_age_days = Some(v.parse().map_err(|e| {
+            ConfigError(format!(
+                "invalid value for CALOD_API__RETENTION_MAX_AGE_DAYS='{}': {}",
+                v, e
+            ))
+        })?);
+        n += 1;
+    }
+    n += env_bool(
+        env,
+        "CALOD_API__RETENTION_APPLY_ON_STARTUP",
+        &mut api.retention_apply_on_startup,
+    )?;
     if let Some(v) = env("CALOD_API__DURABILITY") {
         api.durability = Some(parse_fsync_strategy(&v).ok_or_else(|| {
             ConfigError(format!("invalid value for CALOD_API__DURABILITY='{}'", v))

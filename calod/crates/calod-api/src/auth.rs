@@ -26,6 +26,9 @@ pub struct AuthContext {
 /// The scope string that authorizes reconcile transitions.
 pub const RECONCILE_SCOPE: &str = "effects:reconcile";
 
+/// The scope string that authorizes admin operations (retention).
+pub const ADMIN_SCOPE: &str = "admin";
+
 impl FromRequestParts<AppState> for AuthContext {
     type Rejection = ApiError;
 
@@ -57,6 +60,7 @@ impl FromRequestParts<AppState> for AuthContext {
             },
             capabilities: CallerCapabilities {
                 can_reconcile: metadata.scopes.contains(RECONCILE_SCOPE),
+                can_admin: metadata.scopes.contains(ADMIN_SCOPE),
             },
         })
     }

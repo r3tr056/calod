@@ -63,6 +63,18 @@ pub enum RecordKind {
         /// The new checkpoint.
         checkpoint: Box<CheckpointRecord>,
     },
+    /// Retention pruned terminal data. Applied deterministically on
+    /// replay: the listed runs (with their events and checkpoints)
+    /// and effects are removed. Idempotent — removing absent ids is
+    /// a no-op, so snapshot/replay overlap is safe.
+    RetentionApplied {
+        /// Cutoff the prune applied (ms since epoch).
+        cutoff_ms: i64,
+        /// Terminal runs removed.
+        run_ids: Vec<uuid::Uuid>,
+        /// Terminal effects removed (includes effects of removed runs).
+        effect_ids: Vec<uuid::Uuid>,
+    },
 }
 
 /// Encode one mutation into a WAL payload.

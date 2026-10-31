@@ -146,6 +146,13 @@ pub struct ApiConfig {
     pub data_dir: Option<PathBuf>,
     /// Ledger WAL durability; defaults to `persistence.aof_fsync_strategy`
     pub durability: Option<FsyncStrategy>,
+    /// Retention: prune terminal effects/runs older than this many days (Phase 1).
+    /// None (default) disables retention.
+    #[serde(default)]
+    pub retention_max_age_days: Option<u64>,
+    /// Apply retention once at server startup.
+    #[serde(default)]
+    pub retention_apply_on_startup: bool,
 }
 
 impl Default for ApiConfig {
@@ -155,6 +162,8 @@ impl Default for ApiConfig {
             listen_addr: "127.0.0.1:7379".parse().unwrap(),
             data_dir: None,
             durability: None,
+            retention_max_age_days: None,
+            retention_apply_on_startup: false,
         }
     }
 }

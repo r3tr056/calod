@@ -44,6 +44,57 @@ use crate::snapshot::{load_snapshot, save_snapshot, LedgerSnapshotManifest, Pers
 /// Number of acquire partitions.
 pub const DEFAULT_PARTITIONS: usize = 64;
 
+/// Point-in-time ledger counters/gauges for metrics export.
+#[derive(Debug, Clone, Default)]
+pub struct LedgerStats {
+    /// Acquires that granted execution.
+    pub acquires_execute: u64,
+    /// Acquires that replayed a stored receipt.
+    pub acquires_replay: u64,
+    /// Acquires that asked the caller to wait.
+    pub acquires_wait: u64,
+    /// Acquires that directed the caller to reconcile.
+    pub acquires_reconcile: u64,
+    /// Successful effect transitions.
+    pub transitions_total: u64,
+    /// Runs removed by retention, cumulative.
+    pub retention_runs_removed: u64,
+    /// Effects removed by retention, cumulative.
+    pub retention_effects_removed: u64,
+    /// Current runs in the index.
+    pub runs_current: usize,
+    /// Current effects in the index.
+    pub effects_current: usize,
+    /// Current events across all runs.
+    pub events_current: usize,
+    /// Current effects by API state name.
+    pub effects_by_state: std::collections::BTreeMap<String, usize>,
+}
+
+#[derive(Default)]
+struct LedgerCounters {
+    acquires_execute: std::sync::atomic::AtomicU64,
+    acquires_replay: std::sync::atomic::AtomicU64,
+    acquires_wait: std::sync::atomic::AtomicU64,
+    acquires_reconcile: std::sync::atomic::AtomicU64,
+    transitions_total: std::sync::atomic::AtomicU64,
+    retention_runs_removed: std::sync::atomic::AtomicU64,
+    retention_effects_removed: std::sync::atomic::AtomicU64,
+}
+
+impl LedgerCounters {
+    fn bump_acquire(&self, decision: EffectDecisionType) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let counter = match decision {
+            EffectDecisionType::Execute => &self.acquires_execute,
+            EffectDecisionType::Replay => &self.acquires_replay,
+            EffectDecisionType::Wait => &self.acquires_wait,
+            EffectDecisionType::Reconcile => &self.acquires_reconcile,
+        };
+        counter.fetch_add(1, Relaxed);
+    }
+}
+
 const DEFAULT_LEASE: Duration = Duration::from_secs(30);
 const MIN_LEASE: Duration = Duration::from_secs(5);
 const MAX_LEASE: Duration = Duration::from_secs(3600);
@@ -55,6 +106,9 @@ pub struct LedgerConfig {
     pub wal: WalConfig,
     /// Directory for index snapshots.
     pub snapshot_dir: PathBuf,
+    /// Retention policy (Phase 1); `None` disables pruning. Manual
+    /// application via [`Ledger::apply_retention`]; not run implicitly.
+    pub retention: Option<RetentionPolicy>,
     /// Number of acquire partitions.
     pub partitions: usize,
     /// Lease duration used when a request does not specify one.
@@ -74,6 +128,7 @@ impl LedgerConfig {
         Self {
             wal: WalConfig::new(dir.join("wal")),
             snapshot_dir: dir.join("snapshots"),
+            retention: None,
             partitions: DEFAULT_PARTITIONS,
             default_lease: DEFAULT_LEASE,
             min_lease: MIN_LEASE,
@@ -84,6 +139,12 @@ impl LedgerConfig {
     /// Override the WAL durability class.
     pub fn with_wal_config(mut self, wal: WalConfig) -> Self {
         self.wal = wal;
+        self
+    }
+
+    /// Set the retention policy (see [`RetentionPolicy`]).
+    pub fn with_retention(mut self, retention: Option<RetentionPolicy>) -> Self {
+        self.retention = retention;
         self
     }
 }
@@ -135,6 +196,23 @@ impl Indexes {
                 let mut checkpoints = self.checkpoints.entry(checkpoint.run_id).or_default();
                 if !checkpoints.iter().any(|c| c.id == checkpoint.id) {
                     checkpoints.push(*checkpoint);
+                }
+            }
+            RecordKind::RetentionApplied {
+                run_ids,
+                effect_ids,
+                ..
+            } => {
+                for run_id in &run_ids {
+                    self.runs.remove(run_id);
+                    self.events.remove(run_id);
+                    self.checkpoints.remove(run_id);
+                    self.run_locks.remove(run_id);
+                }
+                for effect_id in &effect_ids {
+                    if let Some((_, effect)) = self.effects_by_id.remove(effect_id) {
+                        self.effect_ids.remove(&effect_key_of(&effect));
+                    }
                 }
             }
         }
@@ -254,6 +332,8 @@ pub struct Ledger {
     min_lease: Duration,
     max_lease: Duration,
     indexes: Indexes,
+    counters: LedgerCounters,
+    retention: Option<RetentionPolicy>,
 }
 
 impl Ledger {
@@ -324,6 +404,8 @@ impl Ledger {
             min_lease: config.min_lease,
             max_lease: config.max_lease,
             indexes,
+            counters: LedgerCounters::default(),
+            retention: config.retention,
         })
     }
 
@@ -544,7 +626,10 @@ impl Ledger {
         };
 
         match plan {
-            Plan::Decide(decision) => Ok(decision),
+            Plan::Decide(decision) => {
+                self.counters.bump_acquire(decision.decision);
+                Ok(decision)
+            }
             Plan::Apply {
                 effect,
                 event_type,
@@ -561,6 +646,7 @@ impl Ledger {
                     event: event.map(Box::new),
                 })
                 .await?;
+                self.counters.bump_acquire(decision);
                 Ok(EffectDecision {
                     decision,
                     effect: view,
@@ -734,6 +820,9 @@ impl Ledger {
             event: event.map(Box::new),
         })
         .await?;
+        self.counters
+            .transitions_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(next.view())
     }
 
@@ -1149,6 +1238,163 @@ impl Ledger {
             data: page.iter().map(|c| c.view()).collect(),
             pagination: page_info,
         })
+    }
+
+    // ------------------------------------------------------------------
+    // Retention, export, stats (Phase 1)
+    // ------------------------------------------------------------------
+
+    /// The configured retention policy, if any.
+    pub fn retention_policy(&self) -> Option<RetentionPolicy> {
+        self.retention
+    }
+
+    /// Prune retention-terminal data older than the given policy.
+    ///
+    /// Eligible: effects in a retention-terminal state (committed,
+    /// terminally failed, reconciled) and runs in a terminal state,
+    /// whose last update is at or before `now - max_age_ms`. Pruning
+    /// a run removes its events and checkpoints too; effects of a
+    /// pruned run are removed regardless of their own age. Active,
+    /// retryable, and `outcome_unknown` data is never pruned. The
+    /// prune is persisted as one WAL record before it is applied,
+    /// so replay reproduces it exactly; call [`Ledger::snapshot`]
+    /// afterwards to compact the WAL.
+    pub async fn apply_retention(&self, policy: RetentionPolicy) -> Result<RetentionReport> {
+        let now = self.clock.now_ms();
+        let cutoff_ms = now.saturating_sub(policy.max_age_ms.max(0));
+        let mut run_ids: Vec<Uuid> = self
+            .indexes
+            .runs
+            .iter()
+            .filter(|r| {
+                let run = r.value();
+                run.status.is_terminal() && run.updated_at_ms <= cutoff_ms
+            })
+            .map(|r| r.value().id)
+            .collect();
+        run_ids.sort();
+        let pruned_runs: std::collections::BTreeSet<Uuid> = run_ids.iter().copied().collect();
+        let mut effect_ids: Vec<Uuid> = self
+            .indexes
+            .effects_by_id
+            .iter()
+            .filter(|e| {
+                let effect = e.value();
+                (effect.state.is_retention_terminal() && effect.updated_at_ms <= cutoff_ms)
+                    || effect.run_id.is_some_and(|r| pruned_runs.contains(&r))
+            })
+            .map(|e| e.value().id)
+            .collect();
+        effect_ids.sort();
+        let events_removed: u64 = run_ids
+            .iter()
+            .map(|id| {
+                self.indexes
+                    .events
+                    .get(id)
+                    .map(|events| events.len() as u64)
+                    .unwrap_or(0)
+            })
+            .sum();
+        let report = RetentionReport {
+            runs_removed: run_ids.len() as u64,
+            effects_removed: effect_ids.len() as u64,
+            events_removed,
+            cutoff_ms,
+        };
+        if run_ids.is_empty() && effect_ids.is_empty() {
+            return Ok(report);
+        }
+        self.persist(RecordKind::RetentionApplied {
+            cutoff_ms,
+            run_ids,
+            effect_ids,
+        })
+        .await?;
+        use std::sync::atomic::Ordering::Relaxed;
+        self.counters
+            .retention_runs_removed
+            .fetch_add(report.runs_removed, Relaxed);
+        self.counters
+            .retention_effects_removed
+            .fetch_add(report.effects_removed, Relaxed);
+        Ok(report)
+    }
+
+    /// Prune with the configured policy, then snapshot to compact
+    /// the WAL. Returns the default (zero) report when no policy is
+    /// configured.
+    pub async fn apply_configured_retention(&self) -> Result<RetentionReport> {
+        let Some(policy) = self.retention else {
+            return Ok(RetentionReport::default());
+        };
+        let report = self.apply_retention(policy).await?;
+        if report.runs_removed > 0 || report.effects_removed > 0 {
+            self.snapshot().await?;
+        }
+        Ok(report)
+    }
+
+    /// Gather everything an evidence export needs for one run.
+    /// Scoped: other tenants/projects see 404, exactly like
+    /// [`Ledger::get_run`].
+    pub async fn export_run(&self, scope: &Scope, run_id: Uuid) -> Result<RunExport> {
+        let run = self.run_in_scope(scope, run_id)?;
+        let mut effects: Vec<Effect> = self
+            .indexes
+            .effects_by_id
+            .iter()
+            .filter(|e| e.value().run_id == Some(run_id))
+            .map(|e| e.value().view())
+            .collect();
+        effects.sort_by_key(|e| (e.created_at.clone(), e.id));
+        let events: Vec<Event> = self
+            .indexes
+            .events
+            .get(&run_id)
+            .map(|events| events.iter().map(|e| e.view()).collect())
+            .unwrap_or_default();
+        let mut checkpoints: Vec<Checkpoint> = self
+            .indexes
+            .checkpoints
+            .get(&run_id)
+            .map(|cps| cps.iter().map(|c| c.view()).collect())
+            .unwrap_or_default();
+        checkpoints.sort_by_key(|c| c.event_sequence);
+        Ok(RunExport {
+            run: run.view(),
+            effects,
+            events,
+            checkpoints,
+        })
+    }
+
+    /// Point-in-time counters and gauges for metrics export.
+    pub fn stats(&self) -> LedgerStats {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut effects_by_state: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for entry in self.indexes.effects_by_id.iter() {
+            let state = serde_json::to_string(&entry.value().state.api_state())
+                .unwrap_or_else(|_| "\"unknown\"".to_string())
+                .trim_matches('"')
+                .to_string();
+            *effects_by_state.entry(state).or_default() += 1;
+        }
+        LedgerStats {
+            acquires_execute: self.counters.acquires_execute.load(Relaxed),
+            acquires_replay: self.counters.acquires_replay.load(Relaxed),
+            acquires_wait: self.counters.acquires_wait.load(Relaxed),
+            acquires_reconcile: self.counters.acquires_reconcile.load(Relaxed),
+            transitions_total: self.counters.transitions_total.load(Relaxed),
+            retention_runs_removed: self.counters.retention_runs_removed.load(Relaxed),
+            retention_effects_removed: self.counters.retention_effects_removed.load(Relaxed),
+            runs_current: self.indexes.runs.len(),
+            effects_current: self.indexes.effects_by_id.len(),
+            events_current: self.indexes.events.iter().map(|e| e.value().len()).sum(),
+            effects_by_state,
+        }
     }
 
     // ------------------------------------------------------------------

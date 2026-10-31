@@ -437,6 +437,78 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+  /runs/{run_id}/export:
+    get:
+      tags: [Runs]
+      summary: Export signed evidence for a run
+      operationId: exportRun
+      description: |
+        Returns the run, its effects, its hash-chained events and its
+        checkpoints as one signed evidence bundle. `format=json` (default)
+        returns the bundle with a manifest carrying `bundle_sha256` and an
+        HMAC-SHA256 `signature`; verify offline with
+        `scripts/verify_export.py`. `format=csv` returns the event
+        timeline as CSV with `X-Calod-Bundle-Sha256` and
+        `X-Calod-Export-Signature` response headers.
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - name: format
+          in: query
+          required: false
+          schema: { type: string, enum: [json, csv], default: json }
+      responses:
+        "200":
+          description: Signed evidence bundle (JSON) or event CSV.
+          content:
+            application/json:
+              schema: { type: object }
+            text/csv:
+              schema: { type: string }
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /admin/retention:
+    post:
+      tags: [System]
+      summary: Apply retention pruning (admin scope required)
+      operationId: applyRetention
+      description: |
+        Prunes retention-terminal effects and terminal runs older than
+        `max_age_days` (or the configured policy), then snapshots to
+        compact the WAL when `compact` is true. Requires the `admin`
+        API-key scope. Retention never prunes active, retryable, or
+        `outcome_unknown` data.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                max_age_days: { type: integer, minimum: 0 }
+                compact: { type: boolean, default: true }
+      responses:
+        "200":
+          description: Retention report.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  runs_removed: { type: integer }
+                  effects_removed: { type: integer }
+                  events_removed: { type: integer }
+                  cutoff_ms: { type: integer }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
   /effects:
     post:
       tags: [Effects]
